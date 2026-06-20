@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Stellar Polkit Agent
+Comment=Polkit authentication agent for the Stellar desktop environment
+Exec=stellar-polkit-agent
+OnlyShowIn=Stellar;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

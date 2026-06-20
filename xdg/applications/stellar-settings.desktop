@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Stellar Settings
+Comment=Configuration utility for the Stellar desktop environment
+Exec=stellar-settings
+Icon=preferences-system
+Categories=Stellar;Settings;

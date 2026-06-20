@@ -1,0 +1,15 @@
+# object files
+*.o
+
+# binaries
+bin/
+build/
+
+# generated
+artgen/*
+!artgen/artgen.lua
+
+# various
+*.bak
+*.log
+

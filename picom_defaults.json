@@ -1,0 +1,82 @@
+{
+	"shadow":	true,
+	"shadow-radius":	15,
+	"shadow-offset-x":	-15,
+	"shadow-offset-y":	-15,
+	"shadow-color":		"$shadow_color_focused",
+	"fading": true,
+	"fade-in-step":	0.08,
+	"fade-out-step":	0.06,
+	"fade-delta":	5,
+	"corner-radius":	0,
+	"backend":	"glx",
+	"dithered-present":	false,
+	"vsync":	"true",
+	"detect-rounded-corners":	false,
+	"detect-client-opacity":	true,
+	"use-ewmh-active-win":	true,
+	"detect-transient":	true,
+	"use-damage":	true,
+	"blur":	{
+		"method":	"dual_kawase",
+		"strength":	5,
+		"background":	true,
+		"blur-step":	0.03,
+		"blur-kern":	"3x3box"
+	},
+    "rules": [
+		{
+			"match": "!focused",
+			"dim": 0.0,
+			"opacity": 0.9,
+			"shadow-color": "$shadow_color_unfocused"
+		},
+		{
+			"match": "!focused && _STELLAR_LOCKED@ = 1",
+			"dim": 0.1,
+			"opacity": 1.0,
+			"shadow": false,
+			"blur-background": false
+		},
+		{
+			"match": "!focused && class_g ~= '^stellar_conflux_.*'",
+			"blur-background": false
+		},
+		{
+			"match": "_STELLAR_TILED@ = 1",
+			"shadow": false
+		},
+		{
+			"match": "window_type = 'tooltip'",
+			"fade": true,
+			"shadow": true,
+			"opacity": 0.75,
+			"full-shadow": false
+		},
+		{
+			"match": "window_type = 'combo'",
+			"fade": false,
+			"shadow": true,
+			"opacity": 1.0,
+			"full-shadow": false
+		},
+		{
+			"match": [
+				"name = 'Notification'",
+				"class_g = 'Conky'",
+				"class_g ?= 'Notify-osd'",
+				"class_g = 'Cairo-clock'",
+				"class_g = 'stalonetray'",
+				"_GTK_FRAME_EXTENTS@"
+			],
+			"shadow": false
+		},
+		{
+        	"match": "fullscreen || _NET_WM_WINDOW_TYPE@ *= 'DESKTOP' || _STELLAR_FULLSCREEN_DESKTOP@ = 1 || _STELLAR_SCREENSAVER = 1",
+			"opacity": 1.0,
+			"dim": 0.0,
+			"blur-background": false,
+			"shadow": false
+		}
+	]
+}

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Stellar
+Comment=Stellar Desktop Environment
+Exec=stellar
+Type=Application
+DesktopNames=Stellar

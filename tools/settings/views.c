@@ -1025,6 +1025,9 @@ static void render_display_view(struct nk_context *ctx) {
                         nk_layout_row_dynamic(ctx, 25, 2);
                         nk_checkbox_bool(ctx, "Enable Compositor", &sc->picom_enabled);
                         nk_checkbox_bool(ctx, "Enable System Tray", &sc->tray_enabled);
+                        nk_layout_row_dynamic(ctx, 25, 1);
+                        nk_checkbox_bool(ctx, "Enable TearFree rendering", &sc->tearfree_enabled);
+                        nk_layout_row_dynamic(ctx, 25, 2);
                         nk_checkbox_bool(ctx, "Independent DPMS", &sc->independent_dpms);
                         nk_checkbox_bool(ctx, "Require Explicit Wake", &sc->require_explicit_wake);
 

@@ -541,6 +541,17 @@ void parse_settings_from_json(StellarState *st) {
                 }
                 lua_pop(st->L, 1);
 
+                lua_getfield(st->L, -1, "tearfree");
+                if (lua_istable(st->L, -1)) {
+                    lua_getfield(st->L, -1, "enabled");
+                    if (lua_isboolean(st->L, -1)) {
+						sc->config.tearfree_enabled = lua_toboolean(st->L, -1);
+						log_info("[parse] screen tearfree=%d", sc->config.tearfree_enabled);
+					}
+                    lua_pop(st->L, 1);
+                }
+                lua_pop(st->L, 1);
+
                 // Extract Screen Power Settings
                 lua_getfield(st->L, -1, "power");
                 if (lua_istable(st->L, -1)) {
@@ -776,6 +787,7 @@ static void handle_ipc_line(
 		update_stellar_picom_config(st);
         apply_system_daemons(st);
 		monitor_apply_all_rotations(st);
+		monitor_apply_all_tearfree(st);
 
 		broadcast_line(st, "SETTINGS_RELOADED"); 
 	}

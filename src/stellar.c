@@ -2151,6 +2151,7 @@ static void apply_settings_defaults(StellarState *st) {
 
 		sc->config.picom_enabled = true;
 		sc->config.tray_enabled = true;
+		sc->config.tearfree_enabled = true;
 	}
 }
 
@@ -2868,6 +2869,7 @@ int main(void) {
 
 	monitor_update_all_screens(&st);
 	monitor_apply_all_rotations(&st);
+	monitor_apply_all_tearfree(&st);
 	apply_dpi_settings(&st);
 
 	generate_stellar_xresources(&st);

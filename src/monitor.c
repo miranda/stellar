@@ -488,6 +488,65 @@ void monitor_apply_rotation(StellarState *st, int screen_idx) {
     XRRFreeScreenResources(res);
 }
 
+bool monitor_apply_tearfree(StellarState *st, int screen_idx) {
+    ScreenState *sc = &st->screens[screen_idx];
+    Display *dpy = st->dpy;
+
+    Atom prop = XInternAtom(dpy, "TearFree", True);   // True = only-if-exists
+    if (prop == None) {
+        log_info("TearFree: no driver on this server exposes the property");
+        return false;
+    }
+
+    XRRScreenResources *res = XRRGetScreenResources(dpy, sc->root);
+    if (!res) return false;
+
+    const char *val_str = sc->config.tearfree_enabled ? "on" : "off";
+    Atom val_atom = XInternAtom(dpy, val_str, False);
+    bool applied = false;
+
+    for (int o = 0; o < res->noutput; o++) {
+        XRROutputInfo *oi = XRRGetOutputInfo(dpy, res, res->outputs[o]);
+        if (!oi) continue;
+
+        // Only this screen's output, and only if connected & active.
+        bool is_ours = (sc->output_name[0] != '\0' && oi->name &&
+                        strcmp(oi->name, sc->output_name) == 0);
+
+        if (is_ours && oi->connection == RR_Connected && oi->crtc != None) {
+            // Confirm THIS output's driver actually has the property.
+            int nprop = 0;
+            Atom *props = XRRListOutputProperties(dpy, res->outputs[o], &nprop);
+            bool has_it = false;
+            for (int p = 0; p < nprop; p++)
+                if (props[p] == prop) { has_it = true; break; }
+            if (props) XFree(props);
+
+            if (has_it) {
+                XRRChangeOutputProperty(dpy, res->outputs[o], prop,
+                                        XA_ATOM, 32, PropModeReplace,
+                                        (unsigned char *)&val_atom, 1);
+                applied = true;
+                log_info("TearFree %s on output %s (screen %d)",
+                         val_str, oi->name, screen_idx);
+            } else {
+                log_info("TearFree: output %s driver lacks the property",
+                         oi->name);
+            }
+        }
+        XRRFreeOutputInfo(oi);
+    }
+
+    XRRFreeScreenResources(res);
+    XFlush(dpy);
+    return applied;
+}
+
+void monitor_apply_all_tearfree(StellarState *st) {
+    for (int i = 0; i < st->config.screen_count; i++)
+        monitor_apply_tearfree(st, i);
+}
+
 void monitor_apply_all_rotations(StellarState *st) {
     for (int i = 0; i < st->config.screen_count; i++) {
         monitor_apply_rotation(st, i);

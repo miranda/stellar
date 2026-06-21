@@ -118,7 +118,7 @@ int apply_nk_theme(struct nk_context *ctx, struct nk_cairo_context *cairo_ctx,
     struct nk_color button_hover =
         stellar_theme_color(td->nk_color_button_hover, nk_rgb(0, 0, 80));
     struct nk_color button_active =
-        stellar_theme_color(td->nk_color_button_active, nk_rgb(0, 0, 150));
+        stellar_theme_color(td->nk_color_button_active, nk_rgb(0, 0, 255));
     struct nk_color border =
         stellar_theme_color(td->nk_color_border, nk_rgb(0, 0, 255));
 

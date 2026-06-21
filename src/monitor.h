@@ -12,5 +12,7 @@ void monitor_update_all_screens(StellarState *st);
 void monitor_build_screen_info_json(StellarState *st, char *buf, size_t buf_size);
 void monitor_apply_rotation(StellarState *st, int screen_idx);
 void monitor_apply_all_rotations(StellarState *st);
+bool monitor_apply_tearfree(StellarState *st, int screen_idx);
+void monitor_apply_all_tearfree(StellarState *st);
 
 #endif

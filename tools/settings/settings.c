@@ -569,6 +569,7 @@ static void init_default_settings(void) {
         sc->phys_offset = 0.0f;
         sc->picom_enabled = true;
         sc->tray_enabled = true;
+        sc->tearfree_enabled = true;
         snprintf(sc->rotation, sizeof(sc->rotation), "normal");
 
 		// Init screen layout sequentially horizontally
@@ -781,6 +782,12 @@ static void load_settings(void) {
                 if (cJSON_IsBool(enabled)) sc->tray_enabled = cJSON_IsTrue(enabled);
             }
 
+            cJSON *tearfree = cJSON_GetObjectItemCaseSensitive(screen, "tearfree");
+            if (tearfree) {
+                cJSON *enabled = cJSON_GetObjectItemCaseSensitive(tearfree, "enabled");
+                if (cJSON_IsBool(enabled)) sc->tearfree_enabled = cJSON_IsTrue(enabled);
+            }
+
             cJSON *sc_power = cJSON_GetObjectItemCaseSensitive(screen, "power");
             if (sc_power) {
                 cJSON *indep = cJSON_GetObjectItemCaseSensitive(sc_power, "independent_dpms");
@@ -961,6 +968,11 @@ void save_and_reload(void) {
         cJSON *tray = cJSON_CreateObject();
         cJSON_AddBoolToObject(tray, "enabled", sc->tray_enabled);
         cJSON_AddItemToObject(screen, "tray", tray);
+
+        cJSON *tearfree = cJSON_CreateObject();
+        cJSON_AddBoolToObject(tearfree, "enabled", sc->tearfree_enabled);
+		fprintf(stderr, "[settings SAVE] screen %d tearfree=%d\n", i, sc->tearfree_enabled);
+        cJSON_AddItemToObject(screen, "tearfree", tearfree);
 
         cJSON *sc_power = cJSON_CreateObject();
         cJSON_AddBoolToObject(sc_power, "independent_dpms", sc->independent_dpms);

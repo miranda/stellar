@@ -84,6 +84,7 @@ typedef struct {
     // Feature toggles
     bool picom_enabled;
     bool tray_enabled;
+	bool tearfree_enabled;
 
     // Power behavior
     bool independent_dpms;

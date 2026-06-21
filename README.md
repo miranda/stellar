@@ -1,14 +1,26 @@
 # Stellar Desktop Environment
 
 Stellar is an X11 desktop environment focused on advanced multi-monitor setups, pixel-accurate UI rendering, and deep system-level customization.
+Stellar uses the incredibly powerful and flexible AwesomeWM as its window manager.
 
 It is designed for users who want a desktop that fully embraces the flexibility of Xorg, with support for everything from modern high-DPI and variable refresh rate displays to low-resolution CRT monitors and retro gaming setups.
 
 ## Status
 
-Stellar is currently in early development and is not ready for release yet.
+Stellar is now in early alpha/testing phase, but is not yet ready for an official release.
+The current state is that it works as a daily driver, though it still has a ways to go.  Implemented in the current version:
 
-This repository exists to document the project, track progress, and serve as the foundation for development.
+- Advanced multi-monitor support
+- Mixed DPI display support
+- Mixed refresh rate support, including VRR
+- Support for all FreeType fonts, including true bitmap fonts
+- Windows support tabs for any GUI Terminal app
+- Pixel-accurate rendering of UI elements and fonts
+- 96dpi and 120dpi bitmap UI elements
+- Independent screensaver and power-saving behavior per monitor
+- Easy Xorg configuration through the GUI
+- Automatic detection of hardware and monitor capabilities
+- Compositor support (based on Picom)
 
 ## Goals
 
@@ -25,21 +37,14 @@ Stellar is built around a few core ideas:
 
 Planned and in-progress features include:
 
-- Advanced multi-monitor support
-- Mixed DPI display support
-- Mixed refresh rate support, including VRR
-- Support for modern high-resolution HiDPI displays
-- Support for very low-resolution displays, including CRT monitors
-- DPI-based UI scaling without bitmap scaling or blur
-- Pixel-accurate rendering of UI elements and fonts
-- Support for all FreeType fonts, including true bitmap fonts
-- Independent screensaver and power-saving behavior per monitor
-- Advanced window rules
+- Advanced window rules (beyond even what KDE Plasma offers)
+- More levels of DPI-based bitmap UI scaling (48dpi all the way up to 192dpi)
+- More advanced Xorg configuration options through the GUI
+- Easy resolution/modesetting, with integrated CRT libswitchres
+- Advanced support for very low-resolution displays, including CRT monitors
 - Advanced window and application grouping
-- Real-time Xorg configuration through the GUI
-- Automatic detection of hardware and monitor capabilities
-- Compositor support
 - Support for both modern and retro gaming use cases
+- More first-class Stellar apps and applets, including an audio control panel and network configurator
 
 ## Philosophy
 

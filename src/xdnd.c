@@ -149,7 +149,6 @@ static Window find_xdnd_window(StellarState *st, Window root, int root_x, int ro
     return best;  // None if nothing was XdndAware
 }
 
-
 // Synchronously fetch XdndSelection data as text/uri-list.
 // Returns malloc'd buffer in *out_data, length in *out_len.  
 // Returns true on success.
@@ -262,7 +261,6 @@ static bool fetch_xdnd_data(StellarState *st, int screen_idx,
     return false;
 }
 
-
 // Send XdndEnter to a target window.
 static void xdnd_send_enter(StellarState *st, Window target) {
     XdndProxy *px = &st->xdnd_proxy;
@@ -282,7 +280,6 @@ static void xdnd_send_enter(StellarState *st, Window target) {
 
     XSendEvent(st->dpy, target, False, NoEventMask, &ev);
 }
-
 
 // Send XdndPosition to a target window.
 static void xdnd_send_position(StellarState *st, Window target,
@@ -305,7 +302,6 @@ static void xdnd_send_position(StellarState *st, Window target,
     XSendEvent(st->dpy, target, False, NoEventMask, &ev);
 }
 
-
 // Send XdndLeave to a target window.
 static void xdnd_send_leave(StellarState *st, Window target) {
     XdndProxy *px = &st->xdnd_proxy;
@@ -321,7 +317,6 @@ static void xdnd_send_leave(StellarState *st, Window target) {
 
     XSendEvent(st->dpy, target, False, NoEventMask, &ev);
 }
-
 
 // Send XdndDrop to a target window.
 // (XdndSelection ownership was already claimed in xdnd_proxy_start.)
@@ -342,7 +337,6 @@ static void xdnd_send_drop(StellarState *st, Window target, Time timestamp) {
     XSendEvent(st->dpy, target, False, NoEventMask, &ev);
     XFlush(st->dpy);
 }
-
 
 // Clean up proxy state.
 void xdnd_proxy_cleanup(StellarState *st) {
@@ -377,36 +371,10 @@ void xdnd_proxy_cleanup(StellarState *st) {
     }
     px->uri_len = 0;
     px->current_target = None;
-
-    // Restore the source screen's root cursor. The cross-screen warp guard in
-    // xdnd_proxy_start forced the source root to a static left_ptr to avoid the
-    // animated-cursor sprite-handoff crash. If we leave it there, a cancelled
-    // drag returns the pointer to a source root whose cursor we clobbered, and
-    // the source toolkit's per-window cursors (e.g. a busy spinner) end up
-    // showing through inconsistently. Re-apply the screen's configured themed
-    // cursor so the root is back to its normal state. Only do this if a session
-    // was actually active (source_screen is meaningful) and the index is sane.
-    if (px->state != XDND_PROXY_IDLE &&
-        px->source_screen >= 0 && px->source_screen < st->config.screen_count) {
-        Window src_root = st->screens[px->source_screen].root;
-        const char *theme = get_cursor_theme_for_screen(st, px->source_screen);
-        int size = get_cursor_size_for_screen(st, px->source_screen);
-        if (theme && theme[0] != '\0') XcursorSetTheme(st->dpy, theme);
-        if (size > 0) XcursorSetDefaultSize(st->dpy, size);
-        Cursor cur = XcursorLibraryLoadCursor(st->dpy, "left_ptr");
-        if (cur == None) cur = XCreateFontCursor(st->dpy, XC_left_ptr);
-        if (cur != None) {
-            XDefineCursor(st->dpy, src_root, cur);
-            XFreeCursor(st->dpy, cur);
-        }
-        XFlush(st->dpy);
-    }
-
     px->state = XDND_PROXY_IDLE;
 
     log_info("xdnd: proxy cleaned up");
 }
-
 
 // Called from handle_raw_motion when an XDND drag crosses the screen boundary.
 // Fetches the drag data and enters proxy mode.
@@ -487,25 +455,9 @@ bool xdnd_proxy_start(StellarState *st, int source_screen, int target_screen,
     // mapped, their session targets us and we swallow it cleanly.
     xdnd_shield_map(st, source_screen);
 
-    // WORKAROUND (same Xorg crash as the edge-warp path in handle_raw_motion):
-    // warping across protocol screens while the SOURCE root carries an
-    // *animated* cursor faults the server in its sprite handoff. During an
-    // XDND drag this is especially likely, since toolkits commonly define a
-    // non-default (and sometimes animated) drag cursor. Force the source root
-    // back to a plain static left_ptr and XSync it through BEFORE warping, so
-    // the cursor live at handoff time carries no per-screen animation state.
-    {
-        ScreenState *src_sc = &st->screens[source_screen];
-        Cursor safe_cur = XcursorLibraryLoadCursor(st->dpy, "left_ptr");
-        if (safe_cur == None) {
-            safe_cur = XCreateFontCursor(st->dpy, XC_left_ptr);
-        }
-        if (safe_cur != None) {
-            XDefineCursor(st->dpy, src_sc->root, safe_cur);
-            XFreeCursor(st->dpy, safe_cur);
-        }
-        XSync(st->dpy, False);
-    }
+    // De-animate the source root's cursor before the cross-screen warp,
+    // to prevent the Xorg animated-cursor sprite-handoff crash.
+	reset_cursor_sprite(st, &st->screens[source_screen], source_screen);
 
     // Now warp the pointer to the target screen
     ScreenState *tgt_sc = &st->screens[target_screen];
@@ -520,7 +472,6 @@ bool xdnd_proxy_start(StellarState *st, int source_screen, int target_screen,
 
     return true;
 }
-
 
 // Called every tick / motion while proxy drag is active.
 // Updates XdndEnter/Position/Leave for the window under the cursor.
@@ -554,7 +505,6 @@ void xdnd_proxy_motion(StellarState *st, int root_x, int root_y, Time timestamp)
     XFlush(st->dpy);
 }
 
-
 // Called when the button is released during proxy drag.
 void xdnd_proxy_drop(StellarState *st, Time timestamp) {
     XdndProxy *px = &st->xdnd_proxy;
@@ -578,7 +528,6 @@ void xdnd_proxy_drop(StellarState *st, Time timestamp) {
     // timestamp check.  Simple approach: store the drop time.)
     px->drag_time = timestamp;
 }
-
 
 // Handle SelectionRequest: the drop target asks us for the data.
 // Called from drain_x_events when we get a SelectionRequest event.
@@ -627,7 +576,6 @@ void xdnd_proxy_handle_selection_request(StellarState *st, XSelectionRequestEven
     XSendEvent(st->dpy, req->requestor, False, NoEventMask, &reply);
     XFlush(st->dpy);
 }
-
 
 // Handle XdndFinished or XdndStatus ClientMessages.
 // Called from drain_x_events.

@@ -871,6 +871,26 @@ static void init_all_cursors(StellarState *st) {
     }
 }
 
+// Warping the pointer between protocol screens while the SOURCE root carries an
+// animated cursor (e.g. the startup-notification spinner) faults Xorg in its
+// sprite handoff.  It must be  called immediately before XWarpPointer
+void reset_cursor_sprite(StellarState *st, ScreenState *sc, int screen_idx) {
+    const char *theme = get_cursor_theme_for_screen(st, screen_idx);
+    int size = get_cursor_size_for_screen(st, screen_idx);
+
+    if (theme && theme[0] != '\0') XcursorSetTheme(st->dpy, theme);
+    if (size > 0) XcursorSetDefaultSize(st->dpy, size);
+
+    Cursor cur = XcursorLibraryLoadCursor(st->dpy, "left_ptr");
+    if (cur == None) cur = XCreateFontCursor(st->dpy, XC_left_ptr);
+    if (cur != None) {
+        XDefineCursor(st->dpy, sc->root, cur);
+        XFreeCursor(st->dpy, cur);
+    }
+
+    XSync(st->dpy, False);
+}
+
 // Helper to find the application client window inside the AwesomeWM frame.
 // Standard X11 practice is to search the children for the WM_STATE property.
 static Window find_client_window(Display *dpy, Window frame) {
@@ -1592,29 +1612,9 @@ static void handle_raw_motion(StellarState *st, double dx, double dy, Time event
             }
         }
 
-        // WORKAROUND for an Xorg crash in the multi-(protocol-)screen sprite
-        // handoff: warping the pointer across zaphod screens while the SOURCE
-        // root carries an *animated* cursor (e.g. a startup-notification
-        // "watch"/spinner that Awesome transiently defines) faults the server.
-        // A static cursor carries no per-screen animation/timer state, so the
-        // cross-screen sprite handoff has nothing to mismigrate. Force the
-        // source root back to our plain static left_ptr and flush it to the
-        // server BEFORE warping, so whatever cursor is live at warp time is
-        // guaranteed non-animated. After the warp, normal cursor logic
-        // (init_cursor / process_hover_cursor) re-asserts the correct cursor.
-        {
-            Cursor safe_cur = XcursorLibraryLoadCursor(st->dpy, "left_ptr");
-            if (safe_cur == None) {
-                safe_cur = XCreateFontCursor(st->dpy, XC_left_ptr);
-            }
-            if (safe_cur != None) {
-                XDefineCursor(st->dpy, sc->root, safe_cur);
-                XFreeCursor(st->dpy, safe_cur);
-            }
-            // Flush the cursor change on its own so the server applies it
-            // before the warp request is processed.
-            XSync(st->dpy, False);
-        }
+        // De-animate this screen's cursor (theme + size preserved) before the
+        // cross-screen warp, to avoid Xorg animated-cursor sprite-handoff crash.
+		reset_cursor_sprite(st, sc, current);
 
         XWarpPointer(st->dpy, None, tgt_sc->root, 0, 0, 0, 0, warp_x, warp_y);
         XSetInputFocus(st->dpy, tgt_sc->root, RevertToPointerRoot, event_time);

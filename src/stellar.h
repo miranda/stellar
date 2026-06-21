@@ -285,6 +285,7 @@ void generate_stellar_xresources(StellarState *st);
 void apply_stellar_xsettings(StellarState *st);
 void apply_system_daemons(StellarState *st);
 void cleanup_phantom_awesome_drawins(StellarState *st, int screen_num);
+void reset_cursor_sprite(StellarState *st, ScreenState *sc, int screen_idx);
 // Detaches `client` from Awesome (reparent to root), sets _NET_WM_WINDOW_TYPE
 // to `type_value` while unmanaged, then remaps so Awesome re-manages from
 // scratch and reads the new type at manage time. This is the only way to make

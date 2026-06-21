@@ -87,7 +87,7 @@ mousegrabber.run = function(func, cursor)
 
         local result = func(mouse_args)
         if result == false then
-            mousegrabber.stop() 
+            mousegrabber.stop()
         end
         return result
     end
@@ -273,7 +273,7 @@ local function evaluate_state(c)
     if c.stellar_locked ~= is_locked then
         c.stellar_locked = is_locked
         -- Passing nil physically removes the property from X11
-        c:set_xproperty("_STELLAR_LOCKED", is_locked or nil) 
+        c:set_xproperty("_STELLAR_LOCKED", is_locked or nil)
         c:emit_signal("property::stellar_locked")
 
         if is_locked then
@@ -357,38 +357,6 @@ local function update_outline(c)
     o.right.height = g.height + (bw * 2)
 end
 
--- Decouple the visual outline from the raw property::geometry signal.
--- property::geometry fires once per microscopic mouse movement; synchronizing
--- four large wiboxes on every tick floods the single-threaded XCB queue
--- (catastrophic on the 60Hz/2880px DualUp). Instead we mark the active client
--- dirty and flush at most ~60fps via this timer, collapsing thousands of X11
--- move requests per second down to ~60.
-local outline_throttle_pending = nil
-local outline_throttle_timer = gears.timer {
-    timeout = 1 / 60,
-    callback = function()
-        local c = outline_throttle_pending
-        if c and c.valid then
-            local o = grab_outline[c]
-            if o and o.top.visible then
-                update_outline(c)
-            end
-        end
-        -- Nothing left to draw - stop the timer so it isn't spinning idle.
-        outline_throttle_pending = nil
-        outline_throttle_timer:stop()
-    end
-}
-
--- Request a throttled outline refresh for client `c`. Cheap to call on every
--- geometry tick: it only stores the client and ensures the timer is running.
-local function request_outline_update(c)
-    outline_throttle_pending = c
-    if not outline_throttle_timer.started then
-        outline_throttle_timer:start()
-    end
-end
-
 local function show_outline(c, color, width)
 	if c.stellar_locked then return end
 
@@ -414,17 +382,11 @@ function hide_outline(c)
     local o = grab_outline[c]
     if not o then return end
 
-    -- Cancel any queued throttled redraw for this client so the timer
-    -- doesn't re-show the outline one frame after we hide it.
-    if outline_throttle_pending == c then
-        outline_throttle_pending = nil
-    end
-
     o.top.visible = false
     o.bottom.visible = false
     o.left.visible = false
     o.right.visible = false
-    
+
     if active_outline_client == c then
         active_outline_client = nil
     end
@@ -440,7 +402,7 @@ local function begin_grab(c, action)
     if active_outline_client and active_outline_client ~= c then
         hide_outline(active_outline_client)
     end
-    
+
     active_outline_client = c
 
     show_outline(
@@ -686,13 +648,8 @@ function M.setup()
     end
 
     -- Debouncer for state evaluation.
-    -- 0.2s (was 0.05s): a tight 50ms window could fire between erratic mouse
-    -- polls mid-drag, triggering process_client -> update_decorations ->
-    -- stellar::refresh_slices, which reloads every titlebar's Cairo surface on
-    -- the CPU and freezes the drag. 0.2s comfortably clears any realistic
-    -- inter-poll gap so the reload only happens once motion has settled.
     local global_state_timer = gears.timer {
-        timeout = 0.2,
+        timeout = 0.05,
         single_shot = true,
         callback = function()
             if pending_full_sweep then
@@ -744,8 +701,7 @@ function M.setup()
         queue_update(c)
         local o = grab_outline[c]
         if o and o.top.visible then
-            -- Throttled to ~60fps instead of running on every raw geometry tick.
-            request_outline_update(c)
+            update_outline(c)
         end
 
 		local layout = awful.layout.get(c.screen)
@@ -759,21 +715,21 @@ function M.setup()
         if context == "conflux_tab_switch" then
             if active_outline_client and active_outline_client.valid and active_outline_client ~= c then
                 -- The user is holding the mouse down on a tab button to switch and drag.
-                -- If we let Conflux unmap the old tab while it's grabbed, the C-backend 
+                -- If we let Conflux unmap the old tab while it's grabbed, the C-backend
                 -- silently kills the grab, bypassing our outline cleanup completely.
-                
+
                 -- Identify the current action (move vs resize)
                 local action = "mouse_move"
                 if stellar_api._grab and stellar_api._grab.action then
                     action = stellar_api._grab.action
                 end
 
-                -- Force-stop the grab on the old tab natively via Lua. 
+                -- Force-stop the grab on the old tab natively via Lua.
                 -- This guarantees the mousegrabber.stop() override and hide_outline() run.
                 mousegrabber.stop()
 
                 -- Restart the grab and outline on the NEW incoming tab.
-                -- Because the physical mouse button is still held down, 
+                -- Because the physical mouse button is still held down,
                 -- AwesomeWM will seamlessly pick up the drag on the new window!
                 begin_grab(c, action)
             end
@@ -792,7 +748,7 @@ function M.setup()
         evaluate_state(c)
         queue_update(c)
     end)
-    
+
     client.connect_signal("unmanage", function(c)
 		queue_update(c)
 		floating_geometries[c] = nil
@@ -831,7 +787,7 @@ function M.setup()
 			end
 		end
 	end)
-    
+
     client.connect_signal("tagged", function(c, t) evaluate_screen(t.screen) end)
     client.connect_signal("untagged", function(c, t) evaluate_screen(t.screen) end)
 
@@ -850,7 +806,54 @@ function M.setup()
             end
         end)
     end, "mouse.resize")
-    
+
+	local function create_dynamic_title_layout()
+		-- Inherit from a standard layout to get Awesome's setup/child-management boilerplate
+		local layout = wibox.layout.fixed.horizontal()
+
+		-- Override fit to accept whatever boundary the outer align layout provides
+		function layout:fit(context, width, height)
+			return width, height
+		end
+
+		-- Override the draw phase to enforce smart truncation
+		function layout:layout(context, width, height)
+			local result = {}
+			local widgets = self:get_children()
+
+			-- Fallback if setup is incomplete
+			if #widgets < 3 then
+				return wibox.layout.fixed.horizontal.layout(self, context, width, height)
+			end
+
+			local w_text  = widgets[1]
+			local w_trans = widgets[2]
+			local w_flex  = widgets[3]
+
+			-- Determine absolute size required by the transition slice
+			local trans_w = wibox.widget.base.fit_widget(self, context, w_trans, width, height)
+
+			-- Allocate the text up to the remaining width
+			local max_text_w = math.max(0, width - trans_w)
+			local text_req_w = wibox.widget.base.fit_widget(self, context, w_text, max_text_w, height)
+			local text_w = math.min(text_req_w, max_text_w)
+
+			-- Place text and transition slice
+			table.insert(result, wibox.widget.base.place_widget_at(w_text, 0, 0, text_w, height))
+			table.insert(result, wibox.widget.base.place_widget_at(w_trans, text_w, 0, trans_w, height))
+
+			-- Fill any remaining space with the flex background
+			local flex_w = math.max(0, width - text_w - trans_w)
+			if flex_w > 0 then
+				table.insert(result, wibox.widget.base.place_widget_at(w_flex, text_w + trans_w, 0, flex_w, height))
+			end
+
+			return result
+		end
+
+		return layout
+	end
+
     client.connect_signal("request::titlebars", function(c, context, hints)
 		local no_titlebars = c:get_xproperty("_STELLAR_NO_TITLEBARS")
 		local fullscreen_desktop = c:get_xproperty("_STELLAR_FULLSCREEN_DESKTOP")
@@ -858,7 +861,7 @@ function M.setup()
 			c.titlebars_enabled = false
 			return
 		end
-		
+
 	    if c.stellar_titlebars_built then return end
 	    c.stellar_titlebars_built = true
 
@@ -891,11 +894,11 @@ function M.setup()
 		end
 
 		-- Forward-declare the popup so callbacks can reference it to close it
-		local popup_buttons 
+		local popup_buttons
 
 		-- === Confirmation Configuration & Logic ===
         -- Options: "always", "never", "smart" (only if active processes)
-        local terminal_confirm_mode = "smart" 
+        local terminal_confirm_mode = "smart"
         local conflux_workspace = c:get_xproperty("_STELLAR_CONFLUX_WORKSPACE")
 
         local function execute_kill()
@@ -929,7 +932,7 @@ function M.setup()
 			},
 			{
 				create_text_btn("Yes", "#cc0000", execute_kill),
-				create_text_btn("No", "#555555", function() 
+				create_text_btn("No", "#555555", function()
 					if popup_buttons then popup_buttons.visible = false end
 				end),
 				spacing = 12, -- Spacing between the Yes/No buttons
@@ -946,7 +949,7 @@ function M.setup()
 			valign = "center",
 			widget = wibox.container.place
 		}
-		
+
 		-- Define the existing right-hand column (Window Actions)
         local window_actions_col = wibox.widget {
             layout  = wibox.layout.fixed.vertical,
@@ -958,7 +961,7 @@ function M.setup()
                 callback       = function()
                     local conflux_workspace = c:get_xproperty("_STELLAR_CONFLUX_WORKSPACE")
 					local is_conflux = (conflux_workspace and conflux_workspace ~= "")
-                    
+
                     -- If it's not a conflux window, or we never confirm, kill instantly
                     if not is_conflux or terminal_confirm_mode == "never" then
                         execute_kill()
@@ -968,11 +971,11 @@ function M.setup()
                     local function show_prompt()
 						-- Capture current auto-sized dimensions of the main menu
 						local geo = popup_buttons:geometry()
-						
+
 						-- Lock the popup so it cannot shrink when the content changes
 						popup_buttons.minimum_width = geo.width
 						popup_buttons.minimum_height = geo.height
-						
+
 						-- Swap to the centered confirmation wrapper
 						popup_buttons.widget.widget = confirm_wrapper
                     end
@@ -1046,8 +1049,8 @@ function M.setup()
 				if s ~= stellar_api._this_screen then
 					screen_actions_col:add(popup_icon_button {
 						image_inactive = stellar_ui.get_image_path("win", "icon_sticky", nil, nil),
-						callback       = function() 
-							if popup_buttons then popup_buttons.visible = false end 
+						callback       = function()
+							if popup_buttons then popup_buttons.visible = false end
     						if c:get_xproperty("_STELLAR_CONFLUX_WORKSPACE") then
 								conflux.relocate_workspace(c, s)
 							end
@@ -1072,7 +1075,7 @@ function M.setup()
 			visible      = false,
 			bg           = beautiful.bg_normal,
 			border_width = popup_border_width,
-			border_color = popup_border_color, 
+			border_color = popup_border_color,
 			shape        = gears.shape.rect,
 			widget       = {
 				main_popup_layout,
@@ -1086,7 +1089,7 @@ function M.setup()
 			if not popup_buttons.visible then
 				-- Revert back to the main menu for the next time it opens
 				popup_buttons.widget.widget = main_popup_layout
-				
+
 				-- Release the locked dimensions so it can auto-size normally again
 				popup_buttons.minimum_width = nil
 				popup_buttons.minimum_height = nil
@@ -1185,9 +1188,21 @@ function M.setup()
 			}
 
         awful.titlebar(c, { position = "top", size = slice_data["win"]["upper_left"].h }) : setup {
-            { stellar_ui.create_slice(c, "win", "upper_left", false, slice_data), top_text_stack, stellar_ui.create_slice(c, "win", "title_trans", false, slice_data), layout = wibox.layout.fixed.horizontal },
-            stellar_ui.create_slice(c, "win", "bar_flex", true, slice_data),
-            { hover_area, stellar_ui.create_slice(c, "win", "upper_right", false, slice_data), layout = wibox.layout.fixed.horizontal },
+            -- Left (Fixed corner)
+            stellar_ui.create_slice(c, "win", "upper_left", false, slice_data),
+            -- Middle (Dynamic area: Text -> Trans -> Flex)
+            {
+                top_text_stack,
+                stellar_ui.create_slice(c, "win", "title_trans", false, slice_data),
+                stellar_ui.create_slice(c, "win", "bar_flex", true, slice_data),
+                layout = create_dynamic_title_layout()
+            },
+            -- Right (Fixed buttons and corner)
+            {
+                hover_area,
+                stellar_ui.create_slice(c, "win", "upper_right", false, slice_data),
+                layout = wibox.layout.fixed.horizontal
+            },
             layout  = wibox.layout.align.horizontal,
             buttons = titlebar_buttons
         }
@@ -1246,7 +1261,7 @@ function M.setup()
 			   and coords.y >= geo.y
 			   and coords.y <= geo.y + geo.height
 		end
-		
+
 		c:connect_signal("property::_STELLAR_CONFLUX_WORKSPACE", function()
     		update_tab_bar(c, slice_data, frame_buttons)
 		end)

@@ -124,18 +124,26 @@ Install the following packages using your distribution's package manager:
     Desktop Utilities: stalonetray. Stellar uses stalonetray rather than the tray built into awesome.
     Screensaver (Optional): Xscreensaver. Stellar uses the hacks from xscreensaver, but uses its own stellar-saver daemon to run them.  
 
-    Note: Stellar will run without picom or fonttosfnt, but will not have compositor effects or bitmap font support, respectively. Stalonetray is also technically optional, if you don't want a system tray, or you want to use the tray built into awesome instead.
+Note:
+- Stellar will run without picom or fonttosfnt, but will not have compositor effects or bitmap font support, respectively.
+- Stalonetray is also technically optional, if you don't want a system tray, or you want to use the tray built into awesome instead.
 
-    Stellar has not yet been tested with Xlibre, it is currently being developed and tested using standard Xorg only. Any reports of issues with Xlibre would be helpful and appreciated.
+Stellar has not yet been tested with Xlibre, it is currently being developed and tested using standard Xorg only. Any reports of issues with Xlibre would be helpful and appreciated.
+
 ###  Install Required Custom Components
 
 Stellar relies on a couple of specific builds for its window manager and terminal multiplexer:
 
-    AwesomeWM: You need awesome-git at a minimum. Stock awesome-git works perfectly fine with Stellar. However, compiling the awesome-stellar-git fork is recommended if you want better support of windows that use client-side decorations.
-    Atch: The integrated terminal multiplexer requires atch to function, but this is optional if you don't care about the Stellar terminal widget. Stock atch will work, but there are bugs in atch that manifest if you move terminal windows between screens.  Cloning and building the timed-drain-filter branch of the atch fork here will eliminate this compatibility issue.
+- AwesomeWM: You need awesome-git at a minimum. Stock awesome-git works perfectly fine with Stellar. However, compiling the awesome-stellar-git fork is recommended if you want better support of windows that use client-side decorations.
+- Atch: The integrated terminal multiplexer requires atch to function, but this is optional if you don't care about the Stellar terminal widget. Stock atch will work, but there are bugs in atch that manifest if you move terminal windows between screens.  Cloning and building the timed-drain-filter branch of the atch fork here will eliminate this compatibility issue.
+
+Clone the awesome fork and follow the Awesome build instructions:
+```
+git clone -b awesome-stellar https://github.com/miranda/awesome.git
+```
+Clone the atch fork and follow the Atch build instructions
 ```
 git clone -b timed-drain-filter https://github.com/miranda/atch.git
-# Follow the Atch build instructions
 ```
 
 ### Build and Install Stellar
@@ -147,7 +155,6 @@ cd stellar
 make
 sudo make install
 ```
-
 ## Usage
 
 Once installed, you can launch the Stellar Desktop Environment in two main ways:
@@ -160,7 +167,6 @@ If you prefer starting your X11 session manually via startx, add the following l
 ```
 exec stellar
 ```
-
 ### Note on Xorg config
 Stellar will generate and install a compatible Xorg config file.  Stellar uses Zaphodheads with isolated screens in the ServerLayout section, which will interfere with the normal operation of other DEs or bare window managers in a multi-monitor setup.  Switching back and forth is handled automatically, just follow the dialog prompt instructions.
 If you get stuck in a Stellar config and it's not giving you the option to revert to a non-Stellar configuration, you can manually delete the file:

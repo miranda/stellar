@@ -1,21 +1,25 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -g
+# Use += so any CFLAGS exported by the environment (e.g. makepkg's hardening
+# and optimization flags on Arch) are preserved rather than overwritten. On a
+# plain local build where CFLAGS is unset, this starts empty and yields exactly
+# these flags.
+CFLAGS += -Wall -Wextra -g
 
 DEPFLAGS = -MMD -MP
 
 PREFIX ?= /usr/local
-LIBDIR ?= $(PREFIX)/lib
+LIBEXECDIR ?= $(PREFIX)/libexec
 DATADIR ?= $(PREFIX)/share
 DESTDIR ?=
 
-STELLAR_LIB_PATH = $(LIBDIR)/stellar
+STELLAR_LIBEXEC_PATH = $(LIBEXECDIR)/stellar
 STELLAR_SHARE_PATH = $(DATADIR)/stellar
 
-DEFINES = -DSTELLAR_LIBEXEC_PATH=\"$(STELLAR_LIB_PATH)\" -DSTELLAR_SHARE_PATH=\"$(STELLAR_SHARE_PATH)\"
+DEFINES = -DSTELLAR_LIBEXEC_PATH=\"$(STELLAR_LIBEXEC_PATH)\" -DSTELLAR_SHARE_PATH=\"$(STELLAR_SHARE_PATH)\"
 CFLAGS += $(DEFINES)
 
 DEST_BINDIR = $(DESTDIR)$(PREFIX)/bin
-DEST_LIBDIR = $(DESTDIR)$(STELLAR_LIB_PATH)
+DEST_LIBEXECDIR = $(DESTDIR)$(STELLAR_LIBEXEC_PATH)
 DEST_SHAREDIR_BASE = $(DESTDIR)$(DATADIR)
 DEST_SHAREDIR = $(DESTDIR)$(STELLAR_SHARE_PATH)
 DEST_PORTALDIR = $(DESTDIR)$(DATADIR)/xdg-desktop-portal/portals
@@ -213,19 +217,19 @@ install:
 	mkdir -p $(DEST_SHAREDIR)/picom
 	install -Dm644 picom_defaults.json $(DEST_SHAREDIR)/picom/defaults.json
 	
-	mkdir -p $(DEST_LIBDIR)
-	install -Dm755 $(BINDIR_LOCAL)/stellar-admin-helper $(DEST_LIBDIR)/stellar-admin-helper
-	install -Dm755 $(BINDIR_LOCAL)/stellar-saver $(DEST_LIBDIR)/stellar-saver
-	install -Dm755 $(BINDIR_LOCAL)/stellar-fileselect $(DEST_LIBDIR)/stellar-fileselect
-	install -Dm755 $(BINDIR_LOCAL)/stellar-dialog $(DEST_LIBDIR)/stellar-dialog
-	install -Dm755 $(BINDIR_LOCAL)/stellar-snitray $(DEST_LIBDIR)/stellar-snitray
+	mkdir -p $(DEST_LIBEXECDIR)
+	install -Dm755 $(BINDIR_LOCAL)/stellar-admin-helper $(DEST_LIBEXECDIR)/stellar-admin-helper
+	install -Dm755 $(BINDIR_LOCAL)/stellar-saver $(DEST_LIBEXECDIR)/stellar-saver
+	install -Dm755 $(BINDIR_LOCAL)/stellar-fileselect $(DEST_LIBEXECDIR)/stellar-fileselect
+	install -Dm755 $(BINDIR_LOCAL)/stellar-dialog $(DEST_LIBEXECDIR)/stellar-dialog
+	install -Dm755 $(BINDIR_LOCAL)/stellar-snitray $(DEST_LIBEXECDIR)/stellar-snitray
 	
-	install -Dm755 $(BINDIR_LOCAL)/xdg-desktop-portal-stellar $(DEST_LIBDIR)/xdg-desktop-portal-stellar
+	install -Dm755 $(BINDIR_LOCAL)/xdg-desktop-portal-stellar $(DEST_LIBEXECDIR)/xdg-desktop-portal-stellar
 	install -Dm644 xdg/portals/stellar.portal $(DEST_PORTALDIR)/stellar.portal
 	install -d $(DEST_DBUSSERVICEDIR)
 	
 	# Notice we substitute the clean path, not the DESTDIR staging path
-	sed 's|@LIBEXECDIR@|$(STELLAR_LIB_PATH)|g' \
+	sed 's|@LIBEXECDIR@|$(STELLAR_LIBEXEC_PATH)|g' \
         xdg/portals/org.freedesktop.impl.portal.desktop.stellar.service.in \
         > $(DEST_DBUSSERVICEDIR)/org.freedesktop.impl.portal.desktop.stellar.service
 	chmod 644 $(DEST_DBUSSERVICEDIR)/org.freedesktop.impl.portal.desktop.stellar.service
@@ -248,7 +252,7 @@ uninstall:
 	rm -f $(DEST_BINDIR)/stellar-settings
 	rm -f $(DEST_BINDIR)/stellar-polkit-agent
 	rm -f $(DESTDIR)/etc/xdg/autostart/stellar-polkit-agent.desktop
-	rm -rf $(DEST_LIBDIR)
+	rm -rf $(DEST_LIBEXECDIR)
 	rm -rf $(DEST_SHAREDIR)
 	rm -f $(DEST_PORTALDIR)/stellar.portal
 	rm -f $(DEST_DBUSSERVICEDIR)/org.freedesktop.impl.portal.desktop.stellar.service

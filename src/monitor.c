@@ -22,6 +22,36 @@ static const char *rotation_to_string(Rotation r) {
     }
 }
 
+// Parse a preferred_mode config string of the form "WxH@R" (R in whole Hz),
+// e.g. "2560x1440@165". The "@R" suffix is optional; when omitted, *refresh_hz
+// is set to 0 meaning "highest refresh available at this resolution".
+// Returns true on a well-formed string, false otherwise (in which case the
+// out-params are left untouched).
+static bool parse_preferred_mode(const char *s, int *width, int *height, int *refresh_hz) {
+    if (!s || s[0] == '\0') return false;
+
+    int w = 0, h = 0, r = 0;
+    // %n is not portable to rely on for validation, so match explicitly.
+    // Accept "WxH" or "WxH@R".
+    char extra = '\0';
+    int fields = sscanf(s, "%dx%d@%d%c", &w, &h, &r, &extra);
+    if (fields == 3 || (fields == 4 && extra == '\0')) {
+        // matched WxH@R
+    } else {
+        // Retry without the refresh component.
+        fields = sscanf(s, "%dx%d%c", &w, &h, &extra);
+        if (fields != 2 && !(fields == 3 && extra == '\0')) return false;
+        r = 0;
+    }
+
+    if (w <= 0 || h <= 0 || r < 0) return false;
+
+    *width = w;
+    *height = h;
+    *refresh_hz = r;
+    return true;
+}
+
 // Sort modes: largest resolution first, then highest refresh first
 static int compare_modes(const void *a, const void *b) {
     const struct { int width; int height; int refresh_mhz; } *ma = a, *mb = b;
@@ -550,5 +580,163 @@ void monitor_apply_all_tearfree(StellarState *st) {
 void monitor_apply_all_rotations(StellarState *st) {
     for (int i = 0; i < st->config.screen_count; i++) {
         monitor_apply_rotation(st, i);
+    }
+}
+
+// Find the RandR mode on `output` best matching the desired WxH @ refresh_hz.
+// refresh_hz == 0 means "highest refresh at this resolution". On a resolution
+// match with a refresh target, the closest refresh within ~1Hz wins; otherwise
+// the highest available refresh at that resolution is chosen. Returns None if
+// no mode matches the requested resolution.
+static RRMode find_mode_for(XRRScreenResources *res, XRROutputInfo *out,
+                            int width, int height, int refresh_hz) {
+    RRMode best = None;
+    double best_hz = 0.0;
+    double best_delta = 1e9;
+
+    for (int m = 0; m < out->nmode; m++) {
+        for (int r = 0; r < res->nmode; r++) {
+            if (res->modes[r].id != out->modes[m]) continue;
+
+            XRRModeInfo *mode = &res->modes[r];
+            if ((int)mode->width != width || (int)mode->height != height) break;
+
+            double hz = 0.0;
+            if (mode->hTotal > 0 && mode->vTotal > 0) {
+                hz = (double)mode->dotClock /
+                     ((double)mode->hTotal * (double)mode->vTotal);
+            }
+
+            if (refresh_hz == 0) {
+                // No refresh target: take the highest refresh at this res.
+                if (hz > best_hz) {
+                    best_hz = hz;
+                    best = mode->id;
+                }
+            } else {
+                double delta = hz - (double)refresh_hz;
+                if (delta < 0) delta = -delta;
+                // Prefer the closest refresh; tie-break toward higher refresh.
+                if (delta < best_delta - 0.01 ||
+                    (delta < best_delta + 0.01 && hz > best_hz)) {
+                    best_delta = delta;
+                    best_hz = hz;
+                    best = mode->id;
+                }
+            }
+            break;
+        }
+    }
+
+    return best;
+}
+
+// Applies the per-screen configured preferred_mode (e.g. "2560x1440@165") to
+// the screen's active CRTC. No-op when preferred_mode is empty, leaving
+// whatever xorg.conf / the X server selected. Mirrors monitor_apply_rotation:
+// finds the active CRTC, swaps only the mode while preserving position,
+// rotation, and outputs, then refreshes cached monitor info.
+bool monitor_apply_preferred_mode(StellarState *st, int screen_idx) {
+    if (screen_idx < 0 || screen_idx >= st->config.screen_count) return false;
+
+    ScreenState *sc = &st->screens[screen_idx];
+
+    // Empty = auto; respect the existing/EDID-chosen mode.
+    if (sc->config.preferred_mode[0] == '\0') return false;
+
+    int want_w = 0, want_h = 0, want_hz = 0;
+    if (!parse_preferred_mode(sc->config.preferred_mode, &want_w, &want_h, &want_hz)) {
+        log_error("Screen %d: malformed preferred_mode '%s'",
+                  screen_idx, sc->config.preferred_mode);
+        return false;
+    }
+
+    XRRScreenResources *res = XRRGetScreenResources(st->dpy, sc->root);
+    if (!res) {
+        log_error("Screen %d: failed to get RandR resources for mode apply", screen_idx);
+        return false;
+    }
+
+    bool succeeded = false;
+
+    // Find the active CRTC (one with a mode and outputs assigned).
+    for (int i = 0; i < res->ncrtc; i++) {
+        XRRCrtcInfo *crtc = XRRGetCrtcInfo(st->dpy, res, res->crtcs[i]);
+        if (!crtc) continue;
+
+        if (crtc->mode == None || crtc->noutput == 0) {
+            XRRFreeCrtcInfo(crtc);
+            continue;
+        }
+
+        // Resolve the target mode against the first output on this CRTC.
+        XRROutputInfo *out = XRRGetOutputInfo(st->dpy, res, crtc->outputs[0]);
+        if (!out) {
+            XRRFreeCrtcInfo(crtc);
+            continue;
+        }
+
+        RRMode target = find_mode_for(res, out, want_w, want_h, want_hz);
+        XRRFreeOutputInfo(out);
+
+        if (target == None) {
+            log_error("Screen %d: no mode matching %dx%d@%d for preferred_mode",
+                      screen_idx, want_w, want_h, want_hz);
+            XRRFreeCrtcInfo(crtc);
+            break;
+        }
+
+        if (target == crtc->mode) {
+            // Already on the requested mode; nothing to do.
+            log_info("Screen %d: preferred_mode %dx%d@%d already active",
+                     screen_idx, want_w, want_h, want_hz);
+            succeeded = true;
+            XRRFreeCrtcInfo(crtc);
+            break;
+        }
+
+        log_info("Screen %d: applying preferred_mode %dx%d@%d",
+                 screen_idx, want_w, want_h, want_hz);
+
+        // Focus safety net (save)
+        Window focused_win;
+        int revert_to;
+        XGetInputFocus(st->dpy, &focused_win, &revert_to);
+
+        Status s = XRRSetCrtcConfig(st->dpy, res, res->crtcs[i], CurrentTime,
+                                    crtc->x, crtc->y,
+                                    target, crtc->rotation,
+                                    crtc->outputs, crtc->noutput);
+
+        if (s == Success) {
+            log_info("Screen %d: preferred_mode applied successfully", screen_idx);
+            succeeded = true;
+        } else {
+            log_error("Screen %d: XRRSetCrtcConfig failed for preferred_mode", screen_idx);
+        }
+
+        // Focus safety net (restore)
+        if (focused_win != None) {
+            XSetInputFocus(st->dpy, focused_win, revert_to, CurrentTime);
+            XFlush(st->dpy);
+        }
+
+        XRRFreeCrtcInfo(crtc);
+
+        if (succeeded) {
+            XRRFreeScreenResources(res);
+            monitor_update_screen_info(st, screen_idx);
+            return true;
+        }
+        break;
+    }
+
+    XRRFreeScreenResources(res);
+    return succeeded;
+}
+
+void monitor_apply_all_preferred_modes(StellarState *st) {
+    for (int i = 0; i < st->config.screen_count; i++) {
+        monitor_apply_preferred_mode(st, i);
     }
 }

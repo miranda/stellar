@@ -323,7 +323,7 @@ void parse_settings_from_json(StellarState *st) {
     // --- Call the JSON parsing function in stellar.lua ---
     lua_getglobal(st->L, "parse_json_file");
     lua_pushstring(st->L, config_path);
-    
+
     if (lua_pcall(st->L, 1, 1, 0) != LUA_OK) {
         log_error("Lua config error: %s", lua_tostring(st->L, -1));
         lua_pop(st->L, 1);
@@ -468,7 +468,7 @@ void parse_settings_from_json(StellarState *st) {
 
             lua_getfield(st->L, -1, screen_key);
             if (lua_istable(st->L, -1)) {
-                
+
                 lua_getfield(st->L, -1, "neighbors");
                 if (lua_istable(st->L, -1)) {
                     lua_getfield(st->L, -1, "left");
@@ -517,7 +517,7 @@ void parse_settings_from_json(StellarState *st) {
                     snprintf(sc->config.preferred_mode, sizeof(sc->config.preferred_mode), "%s", pm);
                 }
                 lua_pop(st->L, 1);
- 
+
                 // Extract DPI Override
                 lua_getfield(st->L, -1, "dpi_override");
                 if (lua_isnumber(st->L, -1)) {
@@ -644,7 +644,7 @@ void parse_settings_from_json(StellarState *st) {
 
     // Clean up the main returned object from the stack
     lua_pop(st->L, 1);
-   
+
     log_info("Configuration successfully loaded into C core.");
 }
 
@@ -723,7 +723,7 @@ static void handle_ipc_line(
             if (strstr(line, "status=ready_for_sync") != NULL) {
                 log_info("AwesomeWM (screen=%d) requested a state sync. Pushing state...", screen_num);
 
-				//allow picom live-update                
+				//allow picom live-update
 				update_stellar_picom_config(st);
 
                 // Force the new Awesome instance to immediately load window rules
@@ -739,7 +739,7 @@ static void handle_ipc_line(
         if (sscanf(line, "FOCUS_WINDOW win=%lu", &w) == 1) {
             // If win=0, fallback to the current screen's root window
             Window target = (w == 0) ? st->screens[st->pointer_screen].root : (Window)w;
-            
+
             XSetInputFocus(st->dpy, target, RevertToPointerRoot, CurrentTime);
             XFlush(st->dpy);
         }
@@ -765,8 +765,8 @@ static void handle_ipc_line(
 
 	if (strncmp(line, "RELOAD_CONFIG", 13) == 0) {
 		log_info("Received RELOAD_CONFIG from a client. Reloading settings.json...");
-		
-		parse_settings_from_json(st); 
+
+		parse_settings_from_json(st);
 
 		// Pick up any newly installed .bdf/.pcf fonts (no-op when fresh)
 		if (stellar_font_sync_bitmap_cache(false) < 0) {
@@ -786,10 +786,11 @@ static void handle_ipc_line(
 
 		update_stellar_picom_config(st);
         apply_system_daemons(st);
+		monitor_apply_all_preferred_modes(st);
 		monitor_apply_all_rotations(st);
 		monitor_apply_all_tearfree(st);
 
-		broadcast_line(st, "SETTINGS_RELOADED"); 
+		broadcast_line(st, "SETTINGS_RELOADED");
 	}
 
 	if (strncmp(line, "GET_APPEARANCE", 14) == 0) {
@@ -1067,8 +1068,20 @@ static void apply_rule_props_from_stack(StellarState *st, Window w,
     } else if (authoritative) {
         Atom prop = XInternAtom(st->dpy, "_STELLAR_NO_TITLEBARS", True);
         if (prop != None) {
-            XDeleteProperty(st->dpy, w, prop);
-            log_info("Removed _STELLAR_NO_TITLEBARS from 0x%lx", w);
+            Atom actual_type;
+            int actual_format;
+            unsigned long nitems, bytes_after;
+            unsigned char *prop_data = NULL;
+
+            // Actually check if the window has the property before logging/deleting
+            if (XGetWindowProperty(st->dpy, w, prop, 0, 0, False, AnyPropertyType,
+                                   &actual_type, &actual_format, &nitems, &bytes_after, &prop_data) == Success) {
+                if (prop_data) XFree(prop_data);
+                if (actual_type != None) {
+                    XDeleteProperty(st->dpy, w, prop);
+                    log_info("Removed _STELLAR_NO_TITLEBARS from 0x%lx", w);
+                }
+            }
         }
     }
     lua_pop(st->L, 1);

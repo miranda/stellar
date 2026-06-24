@@ -113,12 +113,12 @@ float get_font_size_for_screen(StellarState *st, int screen_num) {
 
 const char *get_font_unit_for_screen(StellarState *st, int screen_num) {
     ScreenState *sc = &st->screens[screen_num];
-    
+
     // Check if the screen overrides the global settings AND actually has a unit defined
     if (sc->config.override_global_appearance && sc->config.appearance.font_unit[0] != '\0') {
         return sc->config.appearance.font_unit;
     }
-    
+
     // Fall back to the global unit
     return st->config.appearance.font_unit;
 }
@@ -140,7 +140,7 @@ void ipc_handle_get_appearance(StellarState *st, int fd, int screen_num) {
 
     const char *name = get_font_name_for_screen(st, screen_num);
     float size = get_font_size_for_screen(st, screen_num);
-    
+
     // Fetch the configured unit, defaulting to pt for safety
     const char *unit = get_font_unit_for_screen(st, screen_num);
     if (!unit || unit[0] == '\0') unit = "pt";
@@ -149,7 +149,7 @@ void ipc_handle_get_appearance(StellarState *st, int fd, int screen_num) {
 
     StellarFontInfo fi;
     memset(&fi, 0, sizeof(fi));
-    
+
     // Pass the unit into the newly updated resolver
     if (stellar_font_resolve(name, size, unit, dpi, &fi) != 0) {
         log_error("GET_APPEARANCE: could not resolve font '%s'", name);
@@ -552,11 +552,11 @@ static void start_tray(StellarState *st, int screen_idx) {
     if (sc->tray_respawn_count > 3) {
         log_error(
             "CRITICAL: System tray crash loop detected on screen %d. "
-            "Disabling tray to prevent lockup.", 
+            "Disabling tray to prevent lockup.",
             screen_idx
         );
-        sc->config.tray_enabled = false; 
-        return; 
+        sc->config.tray_enabled = false;
+        return;
     }
 
     pid_t pid = fork();
@@ -568,8 +568,8 @@ static void start_tray(StellarState *st, int screen_idx) {
 		snprintf(icon_size_str, sizeof(icon_size_str), "%d", icon_size);
 		snprintf(slot_size_str, sizeof(slot_size_str), "%d", slot_size);
         execlp(
-            "stalonetray", 
-            "stalonetray", 
+            "stalonetray",
+            "stalonetray",
 			"-display", sc->display_name,
 			"-bg", "black",
 			"-i", icon_size_str,
@@ -580,7 +580,7 @@ static void start_tray(StellarState *st, int screen_idx) {
         exit(1);
     } else if (pid > 0) {
         sc->tray_pid = pid;
-        log_info("System tray started on screen %d (attempt %d, PID %d)", 
+        log_info("System tray started on screen %d (attempt %d, PID %d)",
                  screen_idx, sc->tray_respawn_count, pid);
     }
 }
@@ -588,7 +588,7 @@ static void start_tray(StellarState *st, int screen_idx) {
 static void stop_tray(StellarState *st, int screen_idx) {
     ScreenState *sc = &st->screens[screen_idx];
     if (sc->tray_pid > 0) {
-        log_info("Stopping System tray on screen %d, PID %d)", 
+        log_info("Stopping System tray on screen %d, PID %d)",
                  screen_idx, sc->tray_pid);
         kill(sc->tray_pid, SIGTERM);
     }
@@ -677,11 +677,11 @@ static void start_compositor(StellarState *st, int screen_idx) {
     if (sc->picom_respawn_count > 3) {
         log_error(
             "CRITICAL: Picom crash loop detected on screen %d. "
-            "Disabling compositor to prevent lockup.", 
+            "Disabling compositor to prevent lockup.",
             screen_idx
         );
-        sc->config.picom_enabled = false; 
-        return; 
+        sc->config.picom_enabled = false;
+        return;
     }
 
     pid_t pid = fork();
@@ -695,8 +695,8 @@ static void start_compositor(StellarState *st, int screen_idx) {
 		snprintf(conf_path, sizeof(conf_path), "%s/.cache/stellar/picom/screen_%d.conf", get_user_home_dir(), screen_idx);
 
         execlp(
-            "picom", 
-            "picom", 
+            "picom",
+            "picom",
             "--unredir-if-possible",
             "--config", conf_path,
             NULL
@@ -704,7 +704,7 @@ static void start_compositor(StellarState *st, int screen_idx) {
         exit(1);
     } else if (pid > 0) {
         sc->picom_pid = pid;
-        log_info("Picom started on screen %d (attempt %d, PID %d)", 
+        log_info("Picom started on screen %d (attempt %d, PID %d)",
                  screen_idx, sc->picom_respawn_count, pid);
     }
 }
@@ -713,7 +713,7 @@ static void stop_compositor(StellarState *st, int screen_idx) {
     ScreenState *sc = &st->screens[screen_idx];
     if (sc->picom_pid > 0) {
         log_info("Stopping Picom compositor...");
-        log_info("Stopping Picom compositor on screen %d, PID %d)", 
+        log_info("Stopping Picom compositor on screen %d, PID %d)",
                  screen_idx, sc->picom_pid);
         kill(sc->picom_pid, SIGTERM);
     }
@@ -724,14 +724,14 @@ static void stop_compositor(StellarState *st, int screen_idx) {
 static int x11_error_handler(Display *dpy, XErrorEvent *err) {
     // Silently ignore BadWindow
     if (err->error_code == BadWindow) {
-        return 0; 
+        return 0;
     }
-    
+
     // For other errors, log them
     char msg[256];
     XGetErrorText(dpy, err->error_code, msg, sizeof(msg));
     fprintf(stderr, "[stellar] Ignored non-fatal X11 Error: %s (opcode: %d)\n", msg, err->request_code);
-    
+
     return 0; // Returning 0 prevents the default exit(1) behavior
 }
 
@@ -739,11 +739,59 @@ static void add_pending(Window w, const char *class_name) {
     // Don't double-add
     for (int i = 0; i < pending_count; i++)
         if (pending_windows[i].win == w) return;
-    if (pending_count >= MAX_PENDING_WINDOWS) return;
+
+    // If the array is full, evict the OLDEST entry rather than silently
+    // dropping this one. A full array used to make this a no-op, which meant a
+    // single burst of leaked entries could permanently lock out every future
+    // window from rule matching until X was restarted.
+    if (pending_count >= MAX_PENDING_WINDOWS) {
+        int oldest = 0;
+        for (int i = 1; i < pending_count; i++)
+            if (pending_windows[i].added_at < pending_windows[oldest].added_at)
+                oldest = i;
+        log_info("pending list full; evicting oldest 0x%lx (class='%s')",
+                 pending_windows[oldest].win, pending_windows[oldest].class_name);
+        pending_windows[oldest] = pending_windows[--pending_count];
+    }
+
     PendingWindow *p = &pending_windows[pending_count++];
     p->win = w;
+    p->added_at = time(NULL);
+    p->last_name[0] = '\0';
     snprintf(p->class_name, sizeof(p->class_name), "%s", class_name);
 }
+
+// Evict pending entries older than PENDING_GRACE_SEC. Called from the periodic
+// tick. This is the safety net for windows we add to pending but never receive
+// a MapNotify/DestroyNotify for -- e.g. clients Awesome reparents into its own
+// frame, whose later structure events arrive via the frame's SubstructureNotify
+// (which we don't select) rather than root's (which we do). Without this they
+// accumulate until the array fills.
+/*
+static void expire_stale_pending(void) {
+    time_t now = time(NULL);
+    int i = 0;
+    int expired = 0;
+    char last_class[256] = {0};
+    while (i < pending_count) {
+        if (now - pending_windows[i].added_at > PENDING_GRACE_SEC) {
+            snprintf(last_class, sizeof(last_class), "%s", pending_windows[i].class_name);
+            expired++;
+            pending_windows[i] = pending_windows[--pending_count];
+            // don't advance i; the swapped-in entry needs checking
+        } else {
+            i++;
+        }
+    }
+    // One summary line per sweep instead of one per window. During a window
+    // storm many short-lived classed windows (e.g. REAPER's) age out together;
+    // logging each was needless noise.
+    if (expired > 0) {
+        log_info("expired %d stale pending window(s) (last class='%s')",
+                 expired, last_class);
+    }
+}
+*/
 
 static PendingWindow *find_pending(Window w) {
     for (int i = 0; i < pending_count; i++) {
@@ -920,7 +968,7 @@ static Window find_client_window(Display *dpy, Window frame) {
             }
         }
     }
-    
+
     if (children) XFree(children);
     return client;
 }
@@ -950,7 +998,7 @@ static bool is_window_locked(Display *dpy, Window client_win) {
             XFree(prop);
         }
     }
-    
+
     return is_locked;
 }
 
@@ -970,7 +1018,7 @@ static bool is_in_tab_rect(Display *dpy, Window client_win, int client_x, int cl
     // Fetch the property
     if (XGetWindowProperty(dpy, client_win, tab_rect_atom, 0, 64, False, AnyPropertyType,
                            &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success) {
-        
+
         // Ensure format is 8 (string) and we actually got data
         if (prop && actual_type != None && actual_format == 8 && nitems > 0) {
             char buffer[256] = {0};
@@ -990,7 +1038,7 @@ static bool is_in_tab_rect(Display *dpy, Window client_win, int client_x, int cl
                 // Calculate absolute coordinates based on client_win's (0,0) origin.
                 // Titlebars are OUTSIDE the client geometry.
                 // -------------------------------------------------------------
-                
+
                 // Top Bars (Y is negative, above the client)
                 if (strcmp(anchor, "tl") == 0) {
                     rect_x = x_off;
@@ -998,7 +1046,7 @@ static bool is_in_tab_rect(Display *dpy, Window client_win, int client_x, int cl
                 } else if (strcmp(anchor, "tr") == 0) {
                     rect_x = (int)client_w - (int)w - x_off;
                     rect_y = -(int)h - y_off;
-                } 
+                }
                 // Bottom Bars (Y starts at client_h, extending downwards)
                 else if (strcmp(anchor, "bl") == 0) {
                     rect_x = x_off;
@@ -1033,7 +1081,7 @@ static bool is_in_tab_rect(Display *dpy, Window client_win, int client_x, int cl
             XFree(prop);
         }
     }
-    
+
     return in_rect;
 }
 
@@ -1074,7 +1122,7 @@ static void process_hover_cursor(StellarState *st, Window child_ret, int root_x,
     // Translate pointer coordinates relative to the client window
     int client_x, client_y;
     Window junk_child;
-    XTranslateCoordinates(st->dpy, st->screens[st->pointer_screen].root, client_win, 
+    XTranslateCoordinates(st->dpy, st->screens[st->pointer_screen].root, client_win,
                           root_x, root_y, &client_x, &client_y, &junk_child);
 
     // Get client geometry
@@ -1132,7 +1180,7 @@ void cleanup_phantom_awesome_drawins(StellarState *st, int screen_num) {
     for (unsigned int i = 0; i < num_children; i++) {
         Window w = children[i];
         XWindowAttributes attrs;
-        
+
         // Check if override_redirect is True
         if (XGetWindowAttributes(st->dpy, w, &attrs) == 0) continue;
         if (!attrs.override_redirect) continue;
@@ -1167,8 +1215,8 @@ void cleanup_phantom_awesome_drawins(StellarState *st, int screen_num) {
     if (children) {
         XFree(children);
     }
-    
-    XSync(st->dpy, False); 
+
+    XSync(st->dpy, False);
 }
 
 static bool init_x(StellarState *st) {
@@ -1188,7 +1236,7 @@ static bool init_x(StellarState *st) {
     if (st->config.screen_count > MAX_SCREENS) {
         st->config.screen_count = MAX_SCREENS;
     }
-	
+
 	st->config.power.timeout_screensaver = 30;
 	st->config.power.timeout_dpms = 60;
 	st->config.saver_enabled = true;
@@ -1371,11 +1419,11 @@ static void handle_pointer_tick(StellarState *st) {
         Window root_ret, child_ret;
         int root_x, root_y, win_x, win_y;
         unsigned int mask;
-        
-        if (XQueryPointer(st->dpy, st->screens[st->pointer_screen].root, 
-                          &root_ret, &child_ret, &root_x, &root_y, 
+
+        if (XQueryPointer(st->dpy, st->screens[st->pointer_screen].root,
+                          &root_ret, &child_ret, &root_x, &root_y,
                           &win_x, &win_y, &mask)) {
-            
+
             // Only evaluate hover if the mouse physically moved
             if (root_x != last_root_x || root_y != last_root_y) {
                 process_hover_cursor(st, child_ret, root_x, root_y);
@@ -1445,11 +1493,11 @@ static void handle_pointer_tick(StellarState *st) {
             }
 
             // Yes, it's still here. Do nothing.
-            return; 
+            return;
         }
     }
 
-    // 2. If XQueryPointer failed, the pointer escaped! 
+    // 2. If XQueryPointer failed, the pointer escaped!
     // This happens because handle_raw_motion teleported it, or a keyboard shortcut moved it.
     int current = detect_pointer_screen(st);
     if (current < 0 || current == st->pointer_screen) {
@@ -1461,7 +1509,7 @@ static void handle_pointer_tick(StellarState *st) {
     st->pointer_screen = current;
 
     // 4. Safety Net Focus: Ensure hardware focus follows the pointer.
-    // (If handle_raw_motion did the warp, this is redundant but totally safe. 
+    // (If handle_raw_motion did the warp, this is redundant but totally safe.
     // If a Lua keyboard shortcut did the warp, this fixes the focus.
     XSetInputFocus(st->dpy, st->screens[current].root, RevertToPointerRoot, CurrentTime);
     XFlush(st->dpy);
@@ -1634,23 +1682,23 @@ void send_directed_key_event(StellarState *st, Window target_win, int keycode, b
     ev.window = target_win;
     ev.root = DefaultRootWindow(st->dpy); // Or the specific screen's root if strictly needed
     ev.subwindow = None;
-    ev.time = CurrentTime; 
-    
-    // Arbitrary coordinates, usually ignored by non-mouse handlers, 
+    ev.time = CurrentTime;
+
+    // Arbitrary coordinates, usually ignored by non-mouse handlers,
     // but good practice to put something within the window bounds.
     ev.x = 1;
     ev.y = 1;
     ev.x_root = 1;
     ev.y_root = 1;
     ev.same_screen = True;
-    
+
     ev.keycode = keycode;
     ev.state = 0; // TODO: add modifier masks here (e.g., ShiftMask, ControlMask) for global hotkeys being directed to windows (PTT)
 
     // Send the event directly to the target window
     long event_mask = is_press ? KeyPressMask : KeyReleaseMask;
-    
-    // The 'True' here is the propagate flag. 
+
+    // The 'True' here is the propagate flag.
     XSendEvent(st->dpy, target_win, True, event_mask, (XEvent *)&ev);
     XFlush(st->dpy);
 }
@@ -1704,6 +1752,62 @@ void force_remanage_with_type(StellarState *st, Window client, Atom type_value) 
     XFlush(dpy);
 
     XRemoveFromSaveSet(dpy, client);
+}
+
+// Evaluate a (possibly new) window name against the rules and apply results.
+// Shared by the PropertyNotify fast path and the pending-name poll. `cls` is
+// the window's class; `win_name` its current name. Safe to call repeatedly --
+// apply_window_rules is idempotent and the re-manage is one-shot per window.
+static void evaluate_window_name(StellarState *st, Window win,
+                                 const char *cls, const char *win_name) {
+    if (win_name[0] == '\0') return;
+
+    log_info("Name for 0x%lx: '%s' (evaluating)", win, win_name);
+    RuleResult rr = apply_window_rules(st, win, cls, win_name);
+
+    if (rr.set_type) {
+        // Ensure a tracked entry exists so we can (a) defend the type against
+        // later overwrites and (b) remember whether we've already re-managed.
+        add_tracked(win, cls, win_name, rr.type_value);
+        TrackedWindow *t = find_tracked(win);
+
+        // If the type only just became correct but Awesome already managed the
+        // window, force a single re-manage so it re-reads the type. The call is
+        // a no-op (sets the property in place) if the window isn't yet managed.
+        if (t && !t->remanaged) {
+            t->remanaged = true;
+            force_remanage_with_type(st, win, rr.type_value);
+        }
+    }
+}
+
+// Poll pending windows' names directly instead of relying solely on PropertyNotify.
+// Rationale: stellar selects PropertyChangeMask on the client at CreateNotify,
+// but when Awesome reparents and manages that client it also calls XSelectInput
+// on it, and whichever client selects last owns the whole mask -- so stellar can
+// lose PropertyChangeMask and never receive the _NET_WM_NAME change that carries
+// the real, matchable title. Polling during the short pending grace window makes
+// matching independent of that race. Throttled to ~1 Hz to limit round-trips.
+static void poll_pending_names(StellarState *st) {
+    static time_t last_poll = 0;
+    time_t now = time(NULL);
+    // time() has 1s granularity; that's fine -- the title settles within the
+    // grace window and we only need to catch the change once.
+    if (now == last_poll) return;
+    last_poll = now;
+
+    // evaluate_window_name may add tracked entries / re-manage, but it does not
+    // add to or reorder the pending array, so indexing here stays valid.
+    for (int i = 0; i < pending_count; i++) {
+        PendingWindow *p = &pending_windows[i];
+        char name[256] = {0};
+        get_window_name(st->dpy, p->win, name, sizeof(name));
+        if (name[0] == '\0') continue;
+        if (strcmp(name, p->last_name) == 0) continue;  // unchanged since last look
+
+        snprintf(p->last_name, sizeof(p->last_name), "%s", name);
+        evaluate_window_name(st, p->win, p->class_name, name);
+    }
 }
 
 void reapply_window_rules_to_existing(StellarState *st) {
@@ -1768,7 +1872,7 @@ static void drain_x_events(StellarState *st) {
             XGenericEventCookie *cookie = &ev.xcookie;
             if (XGetEventData(st->dpy, cookie)) {
                 if (cookie->extension == st->xi_opcode) {
-                    
+
                     // ANY raw activity resets the timer for the active screen
                     if (cookie->evtype == XI_RawMotion || cookie->evtype == XI_RawKeyPress) {
                         reset_idle_timer(st);
@@ -1782,9 +1886,9 @@ static void drain_x_events(StellarState *st) {
                         Time event_time = re->time;
 
                         double *val = re->valuators.values;
-                        if (XIMaskIsSet(re->valuators.mask, 0)) dx = *val++; 
-                        if (XIMaskIsSet(re->valuators.mask, 1)) dy = *val++; 
-                        
+                        if (XIMaskIsSet(re->valuators.mask, 0)) dx = *val++;
+                        if (XIMaskIsSet(re->valuators.mask, 1)) dy = *val++;
+
                         handle_raw_motion(st, dx, dy, event_time);
                     }
 
@@ -1853,9 +1957,40 @@ static void drain_x_events(StellarState *st) {
 				int screen = screen_from_root(st, e->parent);
 				if (screen < 0) break;
 
+				// Read the class FIRST and bail before touching the name. Some
+				// apps (notably native Linux REAPER's GDK UI) create and destroy
+				// class-less X windows continuously at frame rate. The per-window
+				// cost is what hurts: each XGetWindowProperty/XGetWMName is a
+				// synchronous round-trip that stalls our event loop. Class-less
+				// windows are never pending/tracked, so for them we do ONE
+				// round-trip (class) and skip the name entirely.
 				char class_name[256] = {0};
-				char win_name[256] = {0};
 				get_window_class(st->dpy, e->window, class_name, sizeof(class_name));
+
+				if (class_name[0] == '\0') {
+					// Known-benign background noise (e.g. native REAPER churning
+					// GDK windows at frame rate). We absorb it cheaply; just keep
+					// a running count and emit a breadcrumb at most every few
+					// minutes so it's traceable without flooding the log.
+					static unsigned long empty_create_count = 0;
+					static time_t empty_create_logged = 0;
+					empty_create_count++;
+					time_t now = time(NULL);
+					if (empty_create_logged == 0) empty_create_logged = now;
+					if (now - empty_create_logged >= 300) {
+						empty_create_logged = now;
+						log_info("class-less CreateNotify total: %lu (benign; absorbed)",
+								 empty_create_count);
+					}
+
+					// DO NOT silently break! The DE still needs to know the window exists.
+					char line[256];
+					snprintf(line, sizeof(line), "XEVENT type=create screen=%d win=0x%lx", screen, e->window);
+					broadcast_line(st, line);
+					break;
+				}
+
+				char win_name[256] = {0};
 				get_window_name(st->dpy, e->window, win_name, sizeof(win_name));
 
 				log_info("CreateNotify: win=0x%lx class='%s' name='%s'",
@@ -1883,7 +2018,7 @@ static void drain_x_events(StellarState *st) {
 						log_info("Deferring rule match for 0x%lx (no name yet)", e->window);
 					}
 				}
-	
+
 				char line[256];
 				snprintf(
 					line,
@@ -1946,33 +2081,26 @@ static void drain_x_events(StellarState *st) {
 				if (win_name[0] == '\0') break;
 
 				const char *cls = pw ? pw->class_name : twn->class_name;
-				log_info("Name changed for 0x%lx: '%s' (re-evaluating)", e->window, win_name);
-				RuleResult rr = apply_window_rules(st, e->window, cls, win_name);
 
-				if (rr.set_type) {
-					// Ensure there's a tracked entry (idempotent) so we can
-					// (a) defend the type against later overwrites and
-					// (b) remember whether we've already forced a re-manage.
-					add_tracked(e->window, cls, win_name, rr.type_value);
-					TrackedWindow *t = find_tracked(e->window);
-
-					// If the type only just became correct but Awesome has
-					// already managed this window, the manage-time read saw the
-					// old type. Force a single re-manage so Awesome re-reads the
-					// correct type. force_remanage_with_type is a no-op (just
-					// sets the property in place) if the window isn't yet
-					// managed, so calling it is always safe.
-					if (t && !t->remanaged) {
-						t->remanaged = true;
-						force_remanage_with_type(st, e->window, rr.type_value);
-						// The re-manage triggers a fresh manage cycle; the new
-						// tracked entry persists across it (we keyed on the
-						// client window, which is unchanged by reparenting).
-					}
+				// Skip if the name hasn't actually changed since we last looked.
+				// Apps (e.g. Xfe) re-set _NET_WM_NAME repeatedly with the same
+				// value on focus/dir changes; re-running the match each time is
+				// wasted work and log noise. We track last-seen name on the
+				// pending entry. (Tracked-only windows have already matched and
+				// have their type defended separately, so an unchanged title
+				// needs no re-eval either.)
+				if (pw) {
+					if (strcmp(win_name, pw->last_name) == 0) break;
+					snprintf(pw->last_name, sizeof(pw->last_name), "%s", win_name);
+//				} else {
+					// tracked-only: compare against the name we recorded then.
+//					if (strcmp(win_name, twn->win_name) == 0) break;
 				}
+
+				evaluate_window_name(st, e->window, cls, win_name);
 				// Do NOT remove_pending or drop the event mask here: a later
 				// name change might newly match a rule. Cleanup happens when
-				// the window is destroyed.
+				// the window is destroyed, maps, or ages out of pending.
 				break;
 			}
 
@@ -2000,7 +2128,7 @@ static void drain_x_events(StellarState *st) {
             case MapNotify: {
                 XMapEvent *e = &ev.xmap;
                 // FILTER: Ignore internal/transient windows
-                if (e->override_redirect) break; 
+                if (e->override_redirect) break;
 
 				// Clean up pending (gave up waiting for name)
 				remove_pending(e->window);
@@ -2186,7 +2314,7 @@ void apply_stellar_xsettings(StellarState *st) {
 
     for (int idx = 0; idx < st->config.screen_count; idx++) {
     	ScreenState *sc = &st->screens[idx];
-		
+
 		char file_path[PATH_MAX];
 		snprintf(file_path, sizeof(file_path), "%s/screen_%d.conf", dir_path, idx);
 
@@ -2197,9 +2325,9 @@ void apply_stellar_xsettings(StellarState *st) {
 			fprintf(f, "\n");
 			fprintf(f, "Gtk/CursorThemeName \"%s\"\n", get_cursor_theme_for_screen(st, idx));
 			fprintf(f, "Gtk/CursorThemeSize %d\n", get_cursor_size_for_screen(st, idx));
-			fprintf(f, "Net/ThemeName \"Adwaita\"\n"); 
+			fprintf(f, "Net/ThemeName \"Adwaita\"\n");
 			fprintf(f, "Net/IconThemeName \"hicolor\"\n");
-			
+
 			fclose(f);
 			log_info("Generated isolated xsettingsd conf at %s", file_path);
 		} else {
@@ -2209,7 +2337,7 @@ void apply_stellar_xsettings(StellarState *st) {
 		if (sc->xsettingsd_pid > 0) {
 			kill(sc->xsettingsd_pid, SIGHUP);
             log_info("Sent SIGHUP to xsettingsd on screen %d for live reload", idx);
-		} 
+		}
 	}
 }
 
@@ -2219,7 +2347,7 @@ static void apply_compositor_settings(StellarState *st) {
 
     for (int idx = 0; idx < st->config.screen_count; idx++) {
     	ScreenState *sc = &st->screens[idx];
-		
+
 		char file_path[PATH_MAX];
 		snprintf(file_path, sizeof(file_path), "%s/screen_%d.conf", dir_path, idx);
 
@@ -2230,9 +2358,9 @@ static void apply_compositor_settings(StellarState *st) {
 			fprintf(f, "\n");
 			fprintf(f, "Gtk/CursorThemeName \"%s\"\n", get_cursor_theme_for_screen(st, idx));
 			fprintf(f, "Gtk/CursorThemeSize %d\n", get_cursor_size_for_screen(st, idx));
-			fprintf(f, "Net/ThemeName \"Adwaita\"\n"); 
+			fprintf(f, "Net/ThemeName \"Adwaita\"\n");
 			fprintf(f, "Net/IconThemeName \"hicolor\"\n");
-			
+
 			fclose(f);
 			log_info("Generated isolated xsettingsd conf at %s", file_path);
 		} else {
@@ -2242,7 +2370,7 @@ static void apply_compositor_settings(StellarState *st) {
 		if (sc->xsettingsd_pid > 0) {
 			kill(sc->xsettingsd_pid, SIGHUP);
             log_info("Sent SIGHUP to xsettingsd on screen %d for live reload", idx);
-		} 
+		}
 	}
 }
 
@@ -2284,8 +2412,8 @@ static pid_t spawn_xsettingsd_for_screen(StellarState *st, int screen_num) {
         char conf_path[PATH_MAX];
         snprintf(conf_path, sizeof(conf_path), "%s/.cache/stellar/xsettingsd/screen_%d.conf", get_user_home_dir(), screen_num);
 
-		execlp("xsettingsd", "xsettingsd", "-s", screen_str, "-c", conf_path, (char *)NULL); 
-        
+		execlp("xsettingsd", "xsettingsd", "-s", screen_str, "-c", conf_path, (char *)NULL);
+
         fprintf(stderr, "[stellar] ERROR: exec xsettingsd (screen %d) failed: %s\n", screen_num, strerror(errno));
         _exit(127);
     }
@@ -2462,9 +2590,9 @@ void apply_system_daemons(StellarState *st) {
 			start_tray(st, i);
 		} else {
 			stop_tray(st, i);
-		} 
+		}
     }
-    
+
 	// Update SNI tray bridge state
     start_snitray(st);
 
@@ -2473,7 +2601,7 @@ void apply_system_daemons(StellarState *st) {
         start_stellar_saver(st);
     } else {
         stop_stellar_saver(st);
-    } 
+    }
 }
 
 static void reap_children(StellarState *st) {
@@ -2485,11 +2613,11 @@ static void reap_children(StellarState *st) {
 
         for (int i = 0; i < st->config.screen_count; i++) {
             ScreenState *sc = &st->screens[i];
-            
+
             // --- Check AwesomeWM ---
             if (sc->awesome_pid == pid) {
                 matched = true;
-                sc->awesome_pid = 0; 
+                sc->awesome_pid = 0;
                 sc->awesome_fd = -1;
 
                 if (WIFEXITED(status)) {
@@ -2512,7 +2640,7 @@ static void reap_children(StellarState *st) {
                 matched = true;
                 sc->picom_pid = -1;
                 log_info("Picom on screen %d exited (PID %d)", i, pid);
-                
+
                 if (sc->config.picom_enabled && g_running && !st->stellar_shutdown) {
                     start_compositor(st, i);
                 }
@@ -2524,7 +2652,7 @@ static void reap_children(StellarState *st) {
                 matched = true;
                 sc->tray_pid = -1;
                 log_info("Stalonetray on screen %d exited (PID %d)", i, pid);
-                
+
                 if (sc->config.tray_enabled && g_running && !st->stellar_shutdown) {
                     start_tray(st, i);
                 }
@@ -2539,13 +2667,13 @@ static void reap_children(StellarState *st) {
                 break;
             }
         }
-        
+
         // --- Check Stellar-saver ---
         if (st->saver_pid == pid) {
             matched = true;
             st->saver_pid = -1;
             log_info("Stellar-saver exited (PID %d)", pid);
-            
+
             if (st->config.saver_enabled && g_running && !st->stellar_shutdown) {
                 start_stellar_saver(st);
             }
@@ -2610,7 +2738,7 @@ static void generate_portal_config(void) {
 
     char dir_path[PATH_MAX];
     snprintf(dir_path, sizeof(dir_path), "%s/.config/xdg-desktop-portal", home);
-    
+
     // Ensure the directory exists
     if (mkdir(dir_path, 0755) != 0 && errno != EEXIST) {
         log_error("Failed to create %s: %s", dir_path, strerror(errno));
@@ -2627,14 +2755,14 @@ static void generate_portal_config(void) {
         fprintf(f, "# Automatically generated by Stellar\n");
         fprintf(f, "[preferred]\n");
         fprintf(f, "default=stellar;gtk;\n");
-        
+
         // 2. Force the standard library to flush to the OS
         fflush(f);
-        
+
         // 3. Force the OS to flush to the physical disk
         int fd = fileno(f);
         if (fd >= 0) fsync(fd);
-        
+
         fclose(f);
 
         // 4. Atomically swap the temp file over the real file
@@ -2654,7 +2782,7 @@ static bool resolve_config(char *out_path, size_t out_size, const char *rel_path
     // Safety check in case home is completely unresolvable
     if (!home || home[0] == '\0') {
         log_error("could not determine home directory for %s config", name);
-        return false; 
+        return false;
     }
 
     char candidate[PATH_MAX];
@@ -2797,8 +2925,8 @@ int main(void) {
     signal(SIGINT, on_terminate);
     signal(SIGTERM, on_terminate);
     signal(SIGHUP, on_terminate);
-	signal(SIGPIPE, SIG_IGN); 
-    
+	signal(SIGPIPE, SIG_IGN);
+
 	if (!ensure_dbus_session(&st)) {
 		log_error("could not establish a D-Bus session bus; continuing");
 	}
@@ -2842,7 +2970,7 @@ int main(void) {
     }
 
 	init_stellar_cache_dirs(&st);
-	generate_portal_config();	
+	generate_portal_config();
 	sync_dbus_environment();
 
     lua_call_noargs(&st, "init");
@@ -2868,6 +2996,7 @@ int main(void) {
 	}
 
 	monitor_update_all_screens(&st);
+	monitor_apply_all_preferred_modes(&st);
 	monitor_apply_all_rotations(&st);
 	monitor_apply_all_tearfree(&st);
 	apply_dpi_settings(&st);
@@ -2971,6 +3100,8 @@ int main(void) {
         handle_pointer_tick(&st);
         check_idle_screens(&st);
 		menu_watch_tick(&st);
+		poll_pending_names(&st);
+//		expire_stale_pending();
     }
 
     log_info("shutting down");

@@ -106,7 +106,7 @@ function match_window_rule(win_class, win_name)
                 result.window_type = props.window_type
             end
 
-			if props.titlebars_enabled  then
+			if props.titlebars_enabled ~= nil  then
 				result.titlebars_enabled = props.titlebars_enabled 
 			end
 

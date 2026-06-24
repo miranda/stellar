@@ -46,6 +46,12 @@
 #define AWESOME_RESPAWN_WINDOW_SEC 30
 #define MAX_PENDING_WINDOWS 32
 #define MAX_TRACKED_WINDOWS 16
+// How long a window may sit in the pending list waiting for its title to settle.
+// The placeholder->real-title transition is sub-second in practice; this is a
+// generous upper bound. Entries older than this are evicted by the periodic
+// sweep so the fixed-size pending array can never fill permanently and silently
+// stop matching new windows (which previously required an X restart to clear).
+#define PENDING_GRACE_SEC 8
 
 #define EDGE_FORCE_THRESHOLD 30.0
 
@@ -74,6 +80,8 @@ typedef struct {
 typedef struct {
     Window win;
     char class_name[256];
+    char last_name[256];  // last name we evaluated, to detect changes when polling
+    time_t added_at;   // for aging out leaked entries (windows we never see map)
 } PendingWindow;
 
 typedef struct {

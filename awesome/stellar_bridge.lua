@@ -1038,8 +1038,9 @@ local function install_stellar_hooks(socket_unix)
 		end
 	end)
 
+
+
     client.connect_signal("manage", function(c)
---		update_locked_state(c)
 -- TODO: change this to set as active client only if normal window w/ titlebars
 		stellar_api.set_active_client(c)
 

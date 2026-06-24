@@ -315,6 +315,16 @@ static void load_gpu_names_from_cache(void) {
                             if (monitor_info[i].connected && 
                                 strcmp(monitor_info[i].output_name, out_name->valuestring) == 0) {
                                 snprintf(monitor_info[i].gpu_name, sizeof(monitor_info[i].gpu_name), "%s", gpu_name_str);
+
+                                // VRR capability is recorded per-output by the
+                                // privileged probe (it can read the property even
+                                // for ports that are inactive in the live Zaphod
+                                // server). Source it from the cache so the toggle
+                                // survives a monitor being offline; the live IPC
+                                // path never carries it.
+                                cJSON *vrr = cJSON_GetObjectItemCaseSensitive(output, "vrr_capable");
+                                if (cJSON_IsBool(vrr))
+                                    monitor_info[i].vrr_capable = cJSON_IsTrue(vrr);
                             }
                         }
                     }
@@ -570,6 +580,7 @@ static void init_default_settings(void) {
         sc->picom_enabled = true;
         sc->tray_enabled = true;
         sc->tearfree_enabled = true;
+        sc->vrr_enabled = false;
         snprintf(sc->rotation, sizeof(sc->rotation), "normal");
 
 		// Init screen layout sequentially horizontally
@@ -788,6 +799,12 @@ static void load_settings(void) {
                 if (cJSON_IsBool(enabled)) sc->tearfree_enabled = cJSON_IsTrue(enabled);
             }
 
+            cJSON *vrr = cJSON_GetObjectItemCaseSensitive(screen, "vrr");
+            if (vrr) {
+                cJSON *enabled = cJSON_GetObjectItemCaseSensitive(vrr, "enabled");
+                if (cJSON_IsBool(enabled)) sc->vrr_enabled = cJSON_IsTrue(enabled);
+            }
+
             cJSON *sc_power = cJSON_GetObjectItemCaseSensitive(screen, "power");
             if (sc_power) {
                 cJSON *indep = cJSON_GetObjectItemCaseSensitive(sc_power, "independent_dpms");
@@ -973,6 +990,10 @@ void save_and_reload(void) {
         cJSON_AddBoolToObject(tearfree, "enabled", sc->tearfree_enabled);
 		fprintf(stderr, "[settings SAVE] screen %d tearfree=%d\n", i, sc->tearfree_enabled);
         cJSON_AddItemToObject(screen, "tearfree", tearfree);
+
+        cJSON *vrr = cJSON_CreateObject();
+        cJSON_AddBoolToObject(vrr, "enabled", sc->vrr_enabled);
+        cJSON_AddItemToObject(screen, "vrr", vrr);
 
         cJSON *sc_power = cJSON_CreateObject();
         cJSON_AddBoolToObject(sc_power, "independent_dpms", sc->independent_dpms);

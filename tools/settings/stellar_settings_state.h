@@ -99,6 +99,11 @@ typedef struct {
     int phys_height_mm;
     int dpi;
 
+    // True when this monitor's output exposes a vrr_capable RandR property set
+    // to 1 (FreeSync/Adaptive-Sync usable). Drives whether the settings app
+    // offers the Variable Refresh checkbox for this screen.
+    bool vrr_capable;
+
     char gpu_name[128];
 
     // Available modes

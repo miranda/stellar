@@ -86,6 +86,15 @@ typedef struct {
     bool tray_enabled;
 	bool tearfree_enabled;
 
+    // Variable Refresh Rate (FreeSync/Adaptive-Sync). When enabled, the
+    // configured preferred_mode acts as the *upper* refresh bound and the
+    // driver varies refresh below it. Only meaningful when the monitor reports
+    // the vrr_capable RandR output property; the settings app gates the toggle
+    // on that. Emitted as Option "VariableRefresh" "true" in the Device section,
+    // which requires an X restart to take effect (it is a driver option, not a
+    // live xrandr-applicable one).
+    bool vrr_enabled;
+
     // Power behavior
     bool independent_dpms;
     bool require_explicit_wake;

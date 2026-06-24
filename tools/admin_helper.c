@@ -189,6 +189,47 @@ static int mode_refresh_mhz(const XRRModeInfo *mode) {
     return 0;
 }
 
+// Read the "vrr_capable" RandR output property. amdgpu/modesetting expose it as
+// a single 0/1 INTEGER on outputs that can drive Adaptive-Sync / FreeSync. The
+// value reflects the *connected* display's capability, so it is only meaningful
+// for outputs that are connected at probe time - which is exactly when this is
+// called. Returns true only when the property exists AND reads back as 1.
+static bool output_vrr_capable(Display *dpy, RROutput output) {
+    Atom prop = XInternAtom(dpy, "vrr_capable", True);  // True = only-if-exists
+    if (prop == None) return false;
+
+    // Confirm this output advertises the property before reading it.
+    int nprop = 0;
+    Atom *props = XRRListOutputProperties(dpy, output, &nprop);
+    bool has_it = false;
+    if (props) {
+        for (int p = 0; p < nprop; p++) {
+            if (props[p] == prop) { has_it = true; break; }
+        }
+        XFree(props);
+    }
+    if (!has_it) return false;
+
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems = 0, bytes_after = 0;
+    unsigned char *data = NULL;
+    bool capable = false;
+
+    if (XRRGetOutputProperty(dpy, output, prop, 0, 1, False, False,
+                             AnyPropertyType, &actual_type, &actual_format,
+                             &nitems, &bytes_after, &data) == Success && data) {
+        if (nitems >= 1) {
+            if (actual_format == 32)      capable = (((long *)data)[0]  != 0);
+            else if (actual_format == 16) capable = (((short *)data)[0] != 0);
+            else if (actual_format == 8)  capable = (data[0]            != 0);
+        }
+        XFree(data);
+    }
+
+    return capable;
+}
+
 void probe_xrandr_and_write(int display_num) {
     char display_str[32];
     snprintf(display_str, sizeof(display_str), ":%d", display_num);
@@ -280,6 +321,8 @@ void probe_xrandr_and_write(int display_num) {
                     fprintf(out, "\",\n");
                     fprintf(out, "          \"phys_width_mm\": %d,\n", phys_w);
                     fprintf(out, "          \"phys_height_mm\": %d,\n", phys_h);
+                    fprintf(out, "          \"vrr_capable\": %s,\n",
+                            output_vrr_capable(dpy, res->outputs[j]) ? "true" : "false");
 
                     if (edid_len > 0) {
                         char *edid_hex = malloc(edid_len * 2 + 1);

@@ -634,6 +634,7 @@ static void generate_xorg_conf(void) {
             // layout is generated and the screen becomes active on restart.
             const char *rot = "";
             const char *pref_mode_setting = "";
+            bool vrr_on = false;
             int dpi = 96;
             int phys_w_mm = 0;
 
@@ -643,6 +644,7 @@ static void generate_xorg_conf(void) {
             if (live_idx >= 0) {
                 rot = state.screens[live_idx].rotation;
                 pref_mode_setting = state.screens[live_idx].preferred_mode;
+                vrr_on = state.screens[live_idx].vrr_enabled;
                 dpi = get_effective_dpi(live_idx);
             } else {
                 // DPI from cache phys size + preferred resolution.
@@ -701,6 +703,14 @@ static void generate_xorg_conf(void) {
             strcat(monitor_sections, mon_buf);
 
             // --- Device Section (ZaphodHeads mapping) ---
+            // VariableRefresh is a driver Option, so it lives in the Device
+            // section and only takes effect on X (re)start - this is why a VRR
+            // toggle classifies as a structural change. The line is omitted
+            // entirely when off so the skeleton diff stays clean.
+            const char *vrr_line = vrr_on
+                ? "    Option      \"VariableRefresh\" \"true\"\n"
+                : "";
+
             char dev_buf[512];
             snprintf(dev_buf, sizeof(dev_buf),
                 "Section \"Device\"\n"
@@ -710,9 +720,11 @@ static void generate_xorg_conf(void) {
                 "    Screen      %d\n"
                 "    Option      \"ZaphodHeads\" \"%s\"\n"
                 "    Option      \"Xinerama\" \"FALSE\"\n"
+                "%s"
                 "    Option      \"AsyncFlipSecondaries\" \"True\"\n"
                 "EndSection\n\n",
-                card_id, head_idx, driver->valuestring, bus_id->valuestring, head_idx, out_name);
+                card_id, head_idx, driver->valuestring, bus_id->valuestring,
+                head_idx, out_name, vrr_line);
             strcat(device_sections, dev_buf);
 
             // --- Screen Section ---

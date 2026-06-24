@@ -813,29 +813,29 @@ static void render_display_view(struct nk_context *ctx) {
                 int active_cols = max_c + 1;
 
                 // Calculate dynamic height to keep the total diagram space constant
-                const float TOTAL_DIAGRAM_HEIGHT = 330.0f; 
+                const float TOTAL_DIAGRAM_HEIGHT = 330.0f;
                 float dynamic_row_height = TOTAL_DIAGRAM_HEIGHT / (float)active_rows;
 
                 // Ensure the row height doesn't shrink so small that the buttons become unclickable
-                if (dynamic_row_height < 80.0f) dynamic_row_height = 80.0f; 
+                if (dynamic_row_height < 80.0f) dynamic_row_height = 80.0f;
 
                 // Draw only the active bounds
                 for (int y = 0; y < active_rows; y++) {
                     // Nuklear automatically divides the window width by active_cols
-                    nk_layout_row_dynamic(ctx, dynamic_row_height, active_cols); 
-                    
+                    nk_layout_row_dynamic(ctx, dynamic_row_height, active_cols);
+
                     for (int x = 0; x < active_cols; x++) {
                         int screen_id = screen_grid[y][x];
                         char box_id[32];
                         snprintf(box_id, sizeof(box_id), "grid_%d_%d", y, x);
 
                         if (nk_group_begin(ctx, box_id, NK_WINDOW_BORDER | NK_WINDOW_NO_SCROLLBAR)) {
-                            
+
                             if (screen_id == -1) {
                                 // Empty slot within the active bounds (e.g., an L-shape layout)
                                 // We just draw a blank space
                                 nk_layout_space_begin(ctx, NK_STATIC, 10, 1);
-                                nk_layout_space_end(ctx); 
+                                nk_layout_space_end(ctx);
                             } else {
                                 char label[16];
                                 snprintf(label, sizeof(label), "Scr %d", screen_id);
@@ -856,9 +856,9 @@ static void render_display_view(struct nk_context *ctx) {
                                 if (x > 0 && nk_button_label(ctx, "<")) {
 									try_move_screen(y, x, 0, -1); // Move Left
                                 } else { nk_spacing(ctx, 1); }
-                                
+
                                 nk_label(ctx, label, NK_TEXT_CENTERED);
-                                
+
                                 // Expand Right (Allows pushing past the current active bound)
                                 if (x < MAX_SCREENS - 1 && nk_button_label(ctx, ">")) {
 									try_move_screen(y, x, 0, 1);  // Move Right
@@ -931,7 +931,7 @@ static void render_display_view(struct nk_context *ctx) {
 
                         nk_label(ctx, "Physical Scale:", NK_TEXT_LEFT);
                         nk_property_float(ctx, "Physical Scale", 0.1f, &sc->phys_scale, 1.0f, 0.01f, 0.1f);
-                        
+
                         nk_label(ctx, "Physical Offset:", NK_TEXT_LEFT);
                         nk_property_float(ctx, "Physical Offset", -0.5f, &sc->phys_offset, 0.5f, 0.01f, 0.1f);
 
@@ -950,14 +950,31 @@ static void render_display_view(struct nk_context *ctx) {
                         nk_label(ctx, "Preferred Mode:", NK_TEXT_LEFT);
                         if (monitor_info_loaded && monitor_info[i].mode_count > 0) {
                             MonitorInfo *mi_modes = &monitor_info[i];
- 
+
+							bool vrr_active = sc->vrr_enabled &&
+											  monitor_info[i].connected &&
+											  monitor_info[i].vrr_capable;
+
                             // Build label array: "Auto" + each available mode
-                            const char *mode_labels[MAX_MONITOR_MODES + 1];
-                            mode_labels[0] = "Auto (native)";
-                            for (int m = 0; m < mi_modes->mode_count; m++) {
-                                mode_labels[m + 1] = mi_modes->modes[m].label;
-                            }
- 
+							char mode_label_buf[MAX_MONITOR_MODES][48];
+							const char *mode_labels[MAX_MONITOR_MODES + 1];
+							mode_labels[0] = "Auto (native)";
+							for (int m = 0; m < mi_modes->mode_count; m++) {
+								if (vrr_active) {
+									// "2560x1440 @ VRR (Max: 165 Hz)" - VRR up front, rate framed as ceiling.
+									snprintf(mode_label_buf[m], sizeof(mode_label_buf[m]),
+											 "%dx%d @ VRR (%d Hz max)",
+											 mi_modes->modes[m].width,
+											 mi_modes->modes[m].height,
+											 (mi_modes->modes[m].refresh_mhz + 500) / 1000);  // mHz->Hz, rounded
+								} else {
+									// Non-VRR: keep the driver-built label as-is.
+									snprintf(mode_label_buf[m], sizeof(mode_label_buf[m]),
+											 "%s", mi_modes->modes[m].label);
+								}
+								mode_labels[m + 1] = mode_label_buf[m];
+							}
+
                             // Find current selection
                             int sel = 0;
                             for (int m = 0; m < mi_modes->mode_count; m++) {
@@ -966,7 +983,7 @@ static void render_display_view(struct nk_context *ctx) {
                                     break;
                                 }
                             }
- 
+
                             int new_sel = nk_combo(ctx, mode_labels, mi_modes->mode_count + 1,
                                                    sel, 25, nk_vec2(250, 200));
                             if (new_sel != sel) {
@@ -989,11 +1006,11 @@ static void render_display_view(struct nk_context *ctx) {
                             if (monitor_info_loaded && monitor_info[i].connected) {
                                 auto_dpi = calc_auto_dpi(monitor_info[i].width, monitor_info[i].phys_width_mm);
                             }
- 
+
                             // Build label array: "Auto (N DPI)" + each step
                             char auto_label[32];
                             snprintf(auto_label, sizeof(auto_label), "Auto (%d DPI)", auto_dpi);
- 
+
                             const char *dpi_labels[NUM_DPI_STEPS + 1];
                             char dpi_step_labels[NUM_DPI_STEPS][16];
                             dpi_labels[0] = auto_label;
@@ -1001,7 +1018,7 @@ static void render_display_view(struct nk_context *ctx) {
                                 snprintf(dpi_step_labels[d], sizeof(dpi_step_labels[d]), "%d DPI", dpi_steps[d]);
                                 dpi_labels[d + 1] = dpi_step_labels[d];
                             }
- 
+
                             // Find current selection
                             int sel = 0;
                             if (sc->dpi_override > 0) {
@@ -1012,7 +1029,7 @@ static void render_display_view(struct nk_context *ctx) {
                                     }
                                 }
                             }
- 
+
                             int new_sel = nk_combo(ctx, dpi_labels, NUM_DPI_STEPS + 1,
                                                    sel, 25, nk_vec2(200, 200));
                             if (new_sel == 0) {
@@ -1027,6 +1044,30 @@ static void render_display_view(struct nk_context *ctx) {
                         nk_checkbox_bool(ctx, "Enable System Tray", &sc->tray_enabled);
                         nk_layout_row_dynamic(ctx, 25, 1);
                         nk_checkbox_bool(ctx, "Enable TearFree rendering", &sc->tearfree_enabled);
+
+                        // Variable Refresh (FreeSync/Adaptive-Sync). Only offered
+                        // when the live monitor advertises vrr_capable. The
+                        // configured Preferred Mode above acts as the refresh
+                        // ceiling; the driver varies refresh below it. This emits
+                        // a Device-section driver option, so toggling it is a
+                        // structural xorg.conf change (needs an X restart) - hence
+                        // the refresh_pending_xorg_change() call to update the
+                        // dirty banner, exactly like rotation/preferred-mode.
+                        if (monitor_info_loaded && monitor_info[i].connected &&
+                            monitor_info[i].vrr_capable) {
+                            bool prev_vrr = sc->vrr_enabled;
+                            nk_checkbox_bool(ctx, "Enable Variable Refresh (VRR/FreeSync)",
+                                             &sc->vrr_enabled);
+                            if (sc->vrr_enabled != prev_vrr) {
+                                refresh_pending_xorg_change();
+                            }
+                        } else if (monitor_info_loaded && monitor_info[i].connected) {
+                            // Capable hardware absent: show why the option is gone
+                            // rather than silently omitting it.
+                            nk_label(ctx, "Variable Refresh: not supported by this monitor",
+                                     NK_TEXT_LEFT);
+                        }
+
                         nk_layout_row_dynamic(ctx, 25, 2);
                         nk_checkbox_bool(ctx, "Independent DPMS", &sc->independent_dpms);
                         nk_checkbox_bool(ctx, "Require Explicit Wake", &sc->require_explicit_wake);

@@ -8,7 +8,7 @@ local log_file = io.open(stellar_log_path, "a")
 
 if log_file then
     -- Set buffering to line-by-line to prevent mangled concurrent writes
-    log_file:setvbuf("line") 
+    log_file:setvbuf("line")
 end
 
 stellar_api.log = function(msg)
@@ -173,12 +173,12 @@ end
 
 local socket_unix = require_socket_unix_or_fail()
 local json = require_json_or_fail()
-stellar_api._this_screen = stellar_screen 
+stellar_api._this_screen = stellar_screen
 stellar_api._num_screens = tonumber(os.getenv("STELLAR_NUM_SCREENS") or "1")
 
 -- Mouse focus settings
 local focus_mode = "sloppy"
-local focus_cooldown = 0.25 
+local focus_cooldown = 0.25
 local focus_guard_active = false
 local pending_focus_client = nil
 local focus_timer = gears.timer {
@@ -203,19 +203,19 @@ end)
 local function load_stellar_settings()
     local file = io.open(os.getenv("HOME") .. "/.config/stellar/settings.json", "r")
     local obj = nil
-    
+
     if file then
         local content = file:read("*all")
         file:close()
-        
+
         local parsed, pos, err = json.decode(content, 1, nil)
-        if err then 
+        if err then
             print("stellar: Error parsing settings: " .. err)
         else
             obj = parsed
         end
     end
-    
+
     -- Ensure the base structure exists even if the file is completely missing
     obj = obj or {}
     obj.appearance = obj.appearance or {}
@@ -302,7 +302,7 @@ end
 local function flush_stellar_rules()
     local ruled = require("ruled")
     local rules = ruled.client.rules
-    
+
     -- Iterate backward to safely remove elements without messing up the index
     for i = #rules, 1, -1 do
         if rules[i].stellar_id then
@@ -467,7 +467,7 @@ end
 
 local function flash_screen()
     local s = awful.screen.focused()
-    
+
     -- Create the flash wibox
     local flash = wibox({
         x = s.geometry.x,
@@ -511,7 +511,7 @@ stellar_api.tasklist_filter = function(c, screen)
     stellar_log("tasklist_filter: " .. tostring(c.name) .. " type=" .. c.type)
 	local fullscreen_desktop = c:get_xproperty("_STELLAR_FULLSCREEN_DESKTOP")
 	if c.type == "desktop" then
-        stellar_log("tasklist_filter: " .. tostring(c.name) 
+        stellar_log("tasklist_filter: " .. tostring(c.name)
             .. " type=desktop fullscreen_desktop=" .. tostring(fullscreen_desktop))
     end
 	if fullscreen_desktop then return true end
@@ -519,14 +519,25 @@ stellar_api.tasklist_filter = function(c, screen)
 end
 
 stellar_api.toggle_fullscreen = function(c)
-	stellar_log("toggle_fullscreen: " .. tostring(c.name) 
-		.. " prevent_fullscreen=" .. tostring(c.prevent_fullscreen)
-		.. " fullscreen=" .. tostring(c.fullscreen))
-	if c.fullscreen then
-		c.fullscreen = false
-	elseif not c.prevent_fullscreen then
-		c.fullscreen = true
-	end
+    stellar_log("toggle_fullscreen: " .. tostring(c.name)
+        .. " prevent_fullscreen=" .. tostring(c.prevent_fullscreen)
+        .. " fullscreen=" .. tostring(c.fullscreen)
+        .. " maximized=" .. tostring(c.maximized))
+
+    if c.fullscreen then
+        c.fullscreen = false
+        -- When we drop fullscreen, Wine will panic and grab Maximized.
+        -- Let it. It's an invisible property in the desktop layer.
+        if is_fullscreen_desktop(c) then
+            fit_to_screen(c)
+        end
+    elseif not c.prevent_fullscreen then
+        -- Strip maximized immediately before asserting fullscreen
+        if c.maximized then
+            c.maximized = false
+        end
+        c.fullscreen = true
+    end
 end
 
 local function play_system_sound(filepath)
@@ -587,7 +598,7 @@ local function apply_stellar_settings(new_settings)
 		awful.rules.apply(c)
 	end
 end
-				
+
 local function install_stellar_hooks(socket_unix)
     local gears = require("gears")
     local awful = require("awful")
@@ -637,7 +648,7 @@ local function install_stellar_hooks(socket_unix)
 		local prev = stellar_api._active_client
 		if prev == c then return end
 		stellar_api.log("set_active_client: " .. tostring(c) .. " (prev=" .. tostring(prev) .. ")")
-		
+
 		if prev and prev.valid then
 			prev.stellar_active = false
 			prev:emit_signal("property::stellar_active")
@@ -848,10 +859,10 @@ local function install_stellar_hooks(socket_unix)
     			end
 
 				local awful = require("awful")
-                -- Target is either the window directly under the mouse, 
+                -- Target is either the window directly under the mouse,
                 -- or the last focused window from AwesomeWM's native history!
                 local target = mouse.current_client or awful.client.focus.history.get(mouse.screen, 0)
-                
+
                 if target and target.valid then
                     client.focus = target                       -- Keep AwesomeWM's UI state correct
                     _G.stellar_api.focus_window(target.window)  -- Force C to set the hardware focus
@@ -876,7 +887,7 @@ local function install_stellar_hooks(socket_unix)
 					_G.cancel_desktop_menu()
 				end
 			end
-            
+
             -- We do absolutely nothing when leaving. AwesomeWM keeps its memory naturally!
             return
         end
@@ -905,7 +916,7 @@ local function install_stellar_hooks(socket_unix)
 		if cmd then
 			print("stellar: Reloading settings from disk...")
 			local new_settings = load_stellar_settings()
-			
+
 			if new_settings then
 				apply_stellar_settings(new_settings)
 				stellar_api.stellar_settings = new_settings
@@ -1006,12 +1017,12 @@ local function install_stellar_hooks(socket_unix)
         callback = function()
             if not stellar.sock then
                 connect()
-			else    
+			else
             	poll_socket()
 			end
         end,
     })
-	
+
 	awesome.connect_signal("startup", function()
         send_line("EVENT type=awesome_startup screen=" .. tostring(stellar.screen_num))
     end)
@@ -1019,11 +1030,11 @@ local function install_stellar_hooks(socket_unix)
 -- TODO: change or get rid of locked custom window state
 	local function update_locked_state(c)
 		local is_locked = false
---[[		
+--[[
 		if c.maximized or c.fullscreen or not c.focusable then
 			is_locked = true
 		end
-	   
+
 		c:set_xproperty("_STELLAR_LOCKED", is_locked)
 ]]--
 	end
@@ -1045,6 +1056,7 @@ local function install_stellar_hooks(socket_unix)
 		stellar_api.set_active_client(c)
 
 		if c.type == "desktop" and is_fullscreen_desktop(c) then
+			fit_to_screen(c)
 			c._stellar_show_in_tasklist = true
 		end
 
@@ -1165,7 +1177,7 @@ local function install_stellar_hooks(socket_unix)
 		if c._needs_mux_placement_fix then
 			-- Immediately remove the flag so we don't interfere with manual user resizes later
 			c._needs_mux_placement_fix = false
-			
+
 			-- Now that it has its true dimensions, re-apply the standard placement rules
 			-- TODO: use global settings set in rc.lua
 			awful.placement.no_overlap(c)
@@ -1181,7 +1193,7 @@ local function install_stellar_hooks(socket_unix)
 			stellar_log("AwesomeWM is quitting. Sending QUITTING event to DE...")
 			send_line("EVENT type=awesome_quitting screen=" .. tostring(stellar.screen_num))
 		end
-		
+
 		-- Give the socket a brief moment to flush the buffer before we sever it
         if stellar.sock and stellar.sock.settimeout then stellar.sock:settimeout(1) end
 		disconnect()

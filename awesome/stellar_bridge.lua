@@ -176,6 +176,83 @@ local json = require_json_or_fail()
 stellar_api._this_screen = stellar_screen
 stellar_api._num_screens = tonumber(os.getenv("STELLAR_NUM_SCREENS") or "1")
 
+-- MRU
+local mru_stack = {}
+
+stellar_api.mru_cycle = function(modkey)
+	-- Bail out if there aren't enough windows to cycle through
+	if #mru_stack < 2 then return end
+
+	-- Create a static snapshot of valid clients for the current screen
+	local cycle_list = {}
+	for _, c in ipairs(mru_stack) do
+		-- Filter out minimized windows and windows on other monitors
+		if c.screen == awful.screen.focused() and not c.minimized then
+			table.insert(cycle_list, c)
+		end
+	end
+
+	if #cycle_list < 2 then return end
+
+	-- Focus the second window in the snapshot (the previously focused one)
+	local current_index = 2
+	local c = cycle_list[current_index]
+	if c then
+		client.focus = c
+		c:raise()
+	end
+
+	-- Map the AwesomeWM modifier name to the X11 release keysyms it can produce.
+    local release_keys = {
+        Mod4 = { Super_L = true, Super_R = true },
+        Mod1 = { Alt_L = true, Alt_R = true },
+        Control = { Control_L = true, Control_R = true },
+        Shift = { Shift_L = true, Shift_R = true },
+    }
+    local stop_on = release_keys[modkey] or { Super_L = true, Super_R = true }
+
+	-- Start the keygrabber to handle holding Mod and repeatedly pressing Tab
+	awful.keygrabber.run(function(mod, key, event)
+		stellar_api.log("grab event=" .. event .. " key=" .. tostring(key)
+			.. " mod=[" .. table.concat(mod, ",") .. "]")
+		-- Stop cycling when the modifier key is released
+		if event == "release" then
+			if stop_on[key] then
+				awful.keygrabber.stop()
+				-- Re-assert focus after the grab tears down, so the grabber's
+				-- own focus restoration can't stomp the selection.
+				local final = cycle_list[current_index]
+				if final and final.valid then
+					gears.timer.delayed_call(function()
+						if final.valid then
+							final:raise()
+							client.focus = final
+							stellar_api.focus_window(final.window)
+						end
+					end)
+				end
+			end
+			return
+		end
+
+		-- Advance the cycle on subsequent Tab presses
+		if event == "press" and key == "Tab" then
+			current_index = current_index + 1
+
+			-- Wrap around to the beginning if we hit the end of the list
+			if current_index > #cycle_list then
+				current_index = 1
+			end
+
+			local next_c = cycle_list[current_index]
+			if next_c then
+				client.focus = next_c
+				next_c:raise()
+			end
+		end
+	end)
+end
+
 -- Mouse focus settings
 local focus_mode = "sloppy"
 local focus_cooldown = 0.25
@@ -493,16 +570,18 @@ stellar_api.tasklist_source = function(s)
     for _, c in ipairs(client.get()) do
         if c.screen == s then
             table.insert(cls, c)
-            if c.type == "desktop" then
+--[[
+			if c.type == "desktop" then
 			    stellar_log("tasklist_source: " .. tostring(c.name)
 						.. " skip_taskbar=" .. tostring(c.skip_taskbar)
 						.. " hidden=" .. tostring(c.hidden)
 						.. " sticky=" .. tostring(c.sticky)
 						.. " tags=" .. tostring(#c:tags()))
             end
-        end
+]]--
+		end
     end
-    stellar_log("tasklist_source: returning " .. #cls .. " clients")
+---    stellar_log("tasklist_source: returning " .. #cls .. " clients")
     return cls
 end
 
@@ -669,10 +748,15 @@ local function install_stellar_hooks(socket_unix)
 
 		for _, cl in ipairs(screen.clients) do
 			if c ~= cl and cl.class ~= "stalonetray" then
-				cl.minimized = true
+				if cl.type == "desktop" and is_fullscreen_desktop(cl) then
+					cl.hidden = true
+				else
+					cl.minimized = true
+				end
 			    stellar_log("*** MINIMIZED CLIENT: " .. tostring(cl.name)
 						.. " type=" .. tostring(cl.type)
 						.. " class=" .. tostring(cl.class)
+						.. " minimized=" .. tostring(cl.minimized)
 						.. " hidden=" .. tostring(cl.hidden)
 				)
 			end
@@ -1075,7 +1159,21 @@ local function install_stellar_hooks(socket_unix)
 		if stellar_api._active_client and stellar_api._active_client == c then
 			stellar_api._active_client = nil
 		end
-        send_line(
+
+		local previous = awful.client.focus.history.previous()
+		if previous and previous.valid then
+			stellar_api._active_client = previous
+		end
+
+		-- Clean up windows when they are closed so the stack doesn't contain dead clients
+		for i, v in ipairs(mru_stack) do
+			if v == c then
+				table.remove(mru_stack, i)
+				break
+			end
+		end
+
+		send_line(
             "EVENT type=client_unmanage screen="
 			.. tostring(stellar.screen_num) .. " win=" .. tostring(c.window) .. " class=" .. tostring(c.class or "")
         )
@@ -1098,6 +1196,16 @@ local function install_stellar_hooks(socket_unix)
 	end)
 
     client.connect_signal("focus", function(c)
+	    -- Find and remove the client from its current position in the stack
+		for i, v in ipairs(mru_stack) do
+			if v == c then
+				table.remove(mru_stack, i)
+				break
+			end
+		end
+		-- Push the newly focused client to the very top (index 1)
+		table.insert(mru_stack, 1, c)
+
         send_line(
             "EVENT type=client_focus screen="
 			.. tostring(stellar.screen_num) .. " win=" .. tostring(c.window) .. " class=" .. tostring(c.class or "")

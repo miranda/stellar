@@ -41,7 +41,7 @@ end)
 if awesome and awesome.register_xproperty then
     -- We define a unique name for our property
     awesome.register_xproperty("IS_AWESOME", "string")
-    
+
     -- We set that property on the root window
     if root and root.set_xproperty then
         root.set_xproperty("IS_AWESOME", "true")
@@ -370,12 +370,9 @@ awful.keyboard.append_global_keybindings({
     ),
     awful.key({ modkey,           }, "Tab",
         function ()
-            awful.client.focus.history.previous()
-            if client.focus then
-                client.focus:raise()
-            end
-        end,
-        {description = "go back", group = "client"}),
+			stellar_api.mru_cycle(modkey)
+		end,
+        {description = "cycle through clients", group = "client"}),
     awful.key({ modkey, "Control" }, "j", function () awful.screen.focus_relative( 1) end,
               {description = "focus the next screen", group = "screen"}),
     awful.key({ modkey, "Control" }, "k", function () awful.screen.focus_relative(-1) end,

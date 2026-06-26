@@ -176,18 +176,29 @@ local json = require_json_or_fail()
 stellar_api._this_screen = stellar_screen
 stellar_api._num_screens = tonumber(os.getenv("STELLAR_NUM_SCREENS") or "1")
 
+local function is_fullscreen_desktop(c)
+	if not c or not c.valid then return false end
+    return c:get_xproperty("_STELLAR_FULLSCREEN_DESKTOP") == true
+end
+
 -- MRU
 local mru_stack = {}
 
 stellar_api.mru_cycle = function(modkey)
-	-- Bail out if there aren't enough windows to cycle through
-	if #mru_stack < 2 then return end
+	local cl = client.focus
+	if is_fullscreen_desktop(cl) then 
+		if cl.fullscreen then return end
+		client.focus = nil
+		stellar_api.log("Released fullscreen desktop client focus")
+	elseif #mru_stack < 2 then
+		return
+	end
 
 	-- Create a static snapshot of valid clients for the current screen
 	local cycle_list = {}
 	for _, c in ipairs(mru_stack) do
-		-- Filter out minimized windows and windows on other monitors
-		if c.screen == awful.screen.focused() and not c.minimized then
+		-- Filter out minimized and hidden windows
+		if not c.minimized and not c.hidden then
 			table.insert(cycle_list, c)
 		end
 	end
@@ -410,10 +421,6 @@ local function resolve_function_strings(k, v)
         end
     end
     return v
-end
-
-local function is_fullscreen_desktop(c)
-	return c:get_xproperty("_STELLAR_FULLSCREEN_DESKTOP")
 end
 
 local function fit_to_screen(c)

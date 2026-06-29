@@ -1273,6 +1273,7 @@ int main(int argc, char *argv[]) {
 		long long last_resize_at = 0;
 		const long long resize_settle_ms = 1;
 
+		int is_first_frame = 1;
 		pending_preview_update = 1;
 
 		while (running) {
@@ -1315,8 +1316,13 @@ int main(int argc, char *argv[]) {
 					nk_xcb_resize_cairo_surface(
 						xcb_ctx, nk_cairo_surface(cairo_ctx));
 
-					resizing = 1;
-					last_resize_at = now_ms();
+					if (is_first_frame) {
+						ui_w = live_w;
+						ui_h = live_h;
+					} else {
+						resizing = 1;
+						last_resize_at = now_ms();
+					}
 
 					nk_cairo_damage(cairo_ctx);
 					need_redraw = 1;
@@ -1449,6 +1455,7 @@ int main(int argc, char *argv[]) {
 				nk_xcb_render(xcb_ctx);
 				nk_clear(ctx);
 				need_redraw = 0;
+				is_first_frame = 0;
 			}
 		}
 

@@ -761,40 +761,6 @@ function conflux.spawn_new(target_workspace, source_client)
         local instance_name	= string.format("stellar_conflux_%s", uid)
         local session_name	= string.format("stellar_conflux_session_%s", uid)
 
-        -- Capture geometry if we are spawning a new tab from an existing window
-        local geom, floating
-        if source_client and source_client.valid then
-            geom = source_client:geometry()
-            floating = source_client.floating
-        end
-
-        -- Inject a single-use rule for this specific window
-        local rule_id = "conflux_spawn_" .. instance_name
-        local custom_rule = {
-            id = rule_id,
-            rule = { instance = instance_name },
-            properties = {
-                placement = function(c)
-                    if target_workspace and geom then
-                        -- It's a new tab! Bypass default placement and force footprint.
-                        c.floating = floating
-                        c:geometry(geom)
-                    else
-                        -- It's a brand new workspace group. Use standard AwesomeWM placement.
-						-- TODO: use global setting in rc.lua
-                        awful.placement.no_overlap(c)
-                        awful.placement.no_offscreen(c)
-                    end
-
-                    -- Self-destruct the rule so the table doesn't bloat over time
-                    ruled.client.remove_rule(rule_id)
-                end
-            }
-        }
-
-        -- Append the rule so it overrides rc.lua global defaults
-        ruled.client.append_rule(custom_rule)
-
         -- Register the intent for the manage signal
         conflux.pending_spawns[instance_name] = workspace_name
 
@@ -866,6 +832,8 @@ client.connect_signal("manage", function(c)
 
                 c.floating = old_c.floating
                 c:geometry(old_c:geometry())
+
+				c._stellar_placement_handled = true
 
                 -- The new client `c` is already mapped at this point (awesome maps
                 -- it before firing manage). So the only swap we need is hiding old_c.

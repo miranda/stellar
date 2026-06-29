@@ -13,6 +13,7 @@
 #define STELLAR_THEME_H
 
 #include <limits.h>
+#include <stddef.h>
 
 // Forward declarations so this header doesn't force nuklear on everyone.
 struct nk_context;
@@ -66,6 +67,15 @@ typedef struct {
 // Returns the screen index (>= 0), or -1 if unknown / DE unreachable.  Useful
 // for global helpers (polkit agent) that have no STELLAR_SCREEN of their own.
 int stellar_screen_for_display(const char *display);
+
+// Resolve an X window id to the Stellar screen index that owns it, by asking
+// the DE.  Authoritative even for windows AwesomeWM has reparented (the usual
+// case for an xdg-portal file-chooser parent).  Returns the screen index
+// (>= 0), or -1 if the window is unknown / DE unreachable.
+int stellar_screen_for_window(unsigned long window_id);
+
+void make_screen_display_name(const char *display_str, int screen_num,
+                              char *out, size_t out_sz);
 
 // Fetch theme colors (relayed from Awesome) AND appearance/font settings
 // (answered by Stellar) for a screen, merged into one struct.

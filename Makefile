@@ -148,8 +148,8 @@ $(BINDIR_LOCAL)/stellar-dialog: $(DIALOG_OBJS) $(SUPPORT_APP_OBJS)
 $(BINDIR_LOCAL)/stellar-polkit-agent: $(POLKIT_AGENT_OBJS) $(SUPPORT_APP_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ $(NUKLEAR_LIBS) $(POLKIT_LIBS)
 
-$(BINDIR_LOCAL)/xdg-desktop-portal-stellar: $(XDG_PORTAL_OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ $(XDG_PORTAL_LIBS)
+$(BINDIR_LOCAL)/xdg-desktop-portal-stellar: $(XDG_PORTAL_OBJS) $(SUPPORT_CORE_OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ $(XDG_PORTAL_LIBS) $(FONT_LIBS)
 
 $(BINDIR_LOCAL)/stellar-snitray: $(SNITRAY_OBJS) $(SUPPORT_CORE_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ $(SNITRAY_LIBS)

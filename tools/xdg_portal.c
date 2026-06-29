@@ -13,11 +13,15 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdarg.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <limits.h>
 
 #include <systemd/sd-bus.h>
 #include <X11/Xlib.h>
+
+#include "stellar_theme.h"   /* stellar_screen_for_window(), make_screen_display_name() */
 
 /* --------------------------------------------------------------------
  * Configuration
@@ -32,92 +36,96 @@
 #endif
 
 /* --------------------------------------------------------------------
- * X11 helpers
+ * Debug file logging
+ * --------------------------------------------------------------------
+ * The portal is D-Bus-activated, so its stderr usually goes nowhere visible.
+ * Route diagnostics to a file instead (override with STELLAR_PORTAL_LOG).
+ * Logging is OFF unless a log path is configured OR STELLAR_PORTAL_DEBUG=1,
+ * so production runs stay silent.  Mirrors the polkit agent's approach. */
+
+static void portal_log(const char *fmt, ...)
+{
+    const char *path = getenv("STELLAR_PORTAL_LOG");
+    if (!path || !path[0]) {
+        if (getenv("STELLAR_PORTAL_DEBUG"))
+            path = "/tmp/stellar-portal.log";
+        else
+            return;   /* logging disabled */
+    }
+
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    char when[32];
+    strftime(when, sizeof(when), "%H:%M:%S", &tm);
+    fprintf(f, "[%s.%03ld pid=%d] ", when, ts.tv_nsec / 1000000L, (int)getpid());
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+
+    fputc('\n', f);
+    fclose(f);
+}
+
+/* Dump the environment variables that matter for screen/theme resolution, so
+ * we can see whether the D-Bus-activated portal inherited them at all. */
+static void portal_log_env(const char *context)
+{
+    static const char *keys[] = {
+        "STELLAR_SOCKET", "STELLAR_SCREEN", "DISPLAY",
+        "XDG_RUNTIME_DIR", "XDG_CURRENT_DESKTOP",
+    };
+    portal_log("---- environment (%s) ----", context);
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        const char *v = getenv(keys[i]);
+        portal_log("    %s=%s", keys[i], v ? v : "(unset)");
+    }
+}
+
+/* --------------------------------------------------------------------
+ * Screen resolution
  * -------------------------------------------------------------------- */
 
 /*
- * Given an X11 window ID (from the portal's parent_window string),
- * figure out which screen it's on and return the DISPLAY string
- * for that screen (e.g. ":0.1").
+ * Parse the portal parent_window string ("x11:0x1a2b3c") and ask the DE which
+ * Stellar screen owns that window.  Returns the screen index (>= 0), or -1 if
+ * the parent is unknown / not an X11 window / the DE is unreachable.
  *
- * Returns a malloc'd string, or NULL on failure.
+ * We deliberately do NOT reconstruct a per-screen DISPLAY string here from the
+ * X server: the old code did, and it broke on non-:0 servers (Xephyr :3.x) and
+ * assumed the X screen index equals the Stellar screen index.  The DE is the
+ * single source of truth for the window->screen mapping (it built the table in
+ * init_x()), and its answer is correct even for windows AwesomeWM reparented.
  */
-static char *display_for_x11_window(unsigned long window_id)
+static int resolve_parent_screen(const char *parent_window)
 {
-    Display *dpy;
-    char *current_display;
-    char *result = NULL;
-
-    current_display = getenv("DISPLAY");
-    if (!current_display)
-        current_display = ":0";
-
-    dpy = XOpenDisplay(current_display);
-    if (!dpy)
-        return NULL;
-
-    int num_screens = ScreenCount(dpy);
-
-    for (int i = 0; i < num_screens; i++) {
-        Screen *scr = ScreenOfDisplay(dpy, i);
-        Window root = RootWindowOfScreen(scr);
-
-        /* Check if the window is in this screen's tree */
-        Window root_ret, parent_ret;
-        Window *children = NULL;
-        unsigned int nchildren = 0;
-
-        /*
-         * XQueryTree will succeed if the window belongs to this root.
-         * We verify root_ret matches this screen's root.
-         */
-        if (XQueryTree(dpy, (Window)window_id, &root_ret, &parent_ret,
-                        &children, &nchildren)) {
-            if (children)
-                XFree(children);
-            if (root_ret == root) {
-				// TODO: This isn't reliable parsing this way.
-                char base[256];
-                snprintf(base, sizeof(base), "%s", current_display);
-
-                /* Remove .N suffix if present */
-                char *dot = strrchr(base, '.');
-                char *colon = strrchr(base, ':');
-                if (dot && colon && dot > colon)
-                    *dot = '\0';
-
-                size_t len = strlen(base) + 16;
-                result = malloc(len);
-                if (result)
-                    snprintf(result, len, "%s.%d", base, i);
-                break;
-            }
-        }
+    if (!parent_window || !*parent_window) {
+        portal_log("resolve_parent_screen: empty parent_window -> -1");
+        return -1;
     }
-
-    XCloseDisplay(dpy);
-    return result;
-}
-
-/*
- * Parse the portal parent_window string.
- * Format for X11: "x11:0x1a2b3c"
- * Returns the display string for that window's screen, or NULL.
- */
-static char *resolve_parent_display(const char *parent_window)
-{
-    if (!parent_window || !*parent_window)
-        return NULL;
 
     if (strncmp(parent_window, "x11:", 4) == 0) {
         unsigned long wid = strtoul(parent_window + 4, NULL, 16);
-        if (wid == 0)
-            return NULL;
-        return display_for_x11_window(wid);
+        portal_log("resolve_parent_screen: parent='%s' wid=0x%lx", parent_window, wid);
+        portal_log_env("before stellar_screen_for_window");
+        if (wid == 0) {
+            portal_log("resolve_parent_screen: wid==0 -> -1");
+            return -1;
+        }
+        int s = stellar_screen_for_window(wid);
+        portal_log("resolve_parent_screen: stellar_screen_for_window(0x%lx) -> %d", wid, s);
+        return s;
     }
 
     /* Wayland or unknown - ignore for now */
-    return NULL;
+    portal_log("resolve_parent_screen: non-x11 parent '%s' -> -1", parent_window);
+    return -1;
 }
 
 /* --------------------------------------------------------------------
@@ -145,18 +153,37 @@ static void free_chooser_result(struct chooser_result *r)
  *   - Print selected paths to stdout, one per line
  *   - Exit 0 on success, 1 on cancel
  *
- * `display` may be NULL (use inherited DISPLAY).
+ * `screen` is the Stellar screen index the chooser should appear and theme
+ * itself on, as resolved from the request's parent window via the DE.  Pass -1
+ * to leave the inherited DISPLAY untouched (chooser falls back to screen 0 /
+ * its own defaults); used when there is no usable X11 parent.
  */
-static int run_filechooser(const char *mode, const char *title,
+static int run_filechooser(const char *mode, const char *app_id, const char *title,
                            int multiple, int directory,
                            const char *current_name,
-                           const char *display,
+                           int screen,
                            struct chooser_result *out)
 {
     int pipefd[2];
     pid_t pid;
 
     memset(out, 0, sizeof(*out));
+
+    /* Log what we're about to hand the child, computed the same way the child
+     * will, so the log shows the actual DISPLAY/STELLAR_SCREEN it gets. */
+    if (screen >= 0) {
+        const char *base = getenv("DISPLAY");
+        if (!base || !base[0]) base = ":0";
+        char preview[64];
+        make_screen_display_name(base, screen, preview, sizeof(preview));
+        portal_log("run_filechooser: mode=%s screen=%d base_DISPLAY=%s "
+                   "child_DISPLAY=%s child_STELLAR_SCREEN=%d",
+                   mode, screen, base, preview, screen);
+    } else {
+        portal_log("run_filechooser: mode=%s screen=%d (UNRESOLVED) -- child "
+                   "inherits portal's DISPLAY=%s, no STELLAR_SCREEN set",
+                   mode, screen, getenv("DISPLAY") ? getenv("DISPLAY") : "(unset)");
+    }
 
     if (pipe(pipefd) < 0)
         return -1;
@@ -174,16 +201,37 @@ static int run_filechooser(const char *mode, const char *title,
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
 
-        if (display)
-            setenv("DISPLAY", display, 1);
+        if (screen >= 0) {
+            /* Place the chooser on the resolved screen: build that screen's
+             * canonical DISPLAY using the SAME helper the DE used in init_x(),
+             * so the string matches exactly (correct on non-:0 / Xephyr).  Also
+             * export STELLAR_SCREEN so the chooser fetches the right screen's
+             * theme + font -- without this it defaults to screen 0 and shows
+             * the wrong font, since the portal is a single global process that
+             * never inherits a per-screen STELLAR_SCREEN. */
+            const char *base = getenv("DISPLAY");
+            if (!base || !base[0]) base = ":0";
 
-        const char *argv[16];
+            char dispbuf[64];
+            make_screen_display_name(base, screen, dispbuf, sizeof(dispbuf));
+            setenv("DISPLAY", dispbuf, 1);
+
+            char scrbuf[16];
+            snprintf(scrbuf, sizeof(scrbuf), "%d", screen);
+            setenv("STELLAR_SCREEN", scrbuf, 1);
+        }
+
+        const char *argv[20];
         int argc = 0;
 
         argv[argc++] = FILECHOOSER_BIN;
         argv[argc++] = "--mode";
         argv[argc++] = mode;  /* "open", "save", or "open-directory" */
 
+        if (app_id && app_id[0] != '\0') {
+            argv[argc++] = "--app-id";
+            argv[argc++] = app_id;
+        }
         if (title) {
             argv[argc++] = "--title";
             argv[argc++] = title;
@@ -200,6 +248,7 @@ static int run_filechooser(const char *mode, const char *title,
         argv[argc] = NULL;
 
         execvp(argv[0], (char * const *)argv);
+        portal_log("execvp(%s) FAILED: %s", argv[0], strerror(errno));
         _exit(127);
     }
 
@@ -382,13 +431,12 @@ static int handle_open_file(sd_bus_message *msg, void *userdata,
 
     parse_options(msg, &multiple, &directory, NULL);
 
-    char *display = resolve_parent_display(parent_window);
+    int screen = resolve_parent_screen(parent_window);
 
     const char *mode = directory ? "open-directory" : "open";
 
     struct chooser_result result;
-    r = run_filechooser(mode, title, multiple, directory, NULL, display, &result);
-    free(display);
+    r = run_filechooser(mode, app_id, title, multiple, directory, NULL, screen, &result);
 
     if (r < 0) {
         return sd_bus_error_set(error,
@@ -430,11 +478,10 @@ static int handle_save_file(sd_bus_message *msg, void *userdata,
 	char *current_name = NULL;
     parse_options(msg, &dummy1, &dummy2, &current_name);
 
-    char *display = resolve_parent_display(parent_window);
+    int screen = resolve_parent_screen(parent_window);
 
     struct chooser_result result;
-    r = run_filechooser("save", title, 0, 0, current_name, display, &result);
-    free(display);
+    r = run_filechooser("save", app_id, title, 0, 0, current_name, screen, &result);
 
     if (r < 0) {
         return sd_bus_error_set(error,
@@ -475,13 +522,12 @@ static int handle_save_files(sd_bus_message *msg, void *userdata,
     int dummy1, dummy2;
     parse_options(msg, &dummy1, &dummy2, NULL);
 
-    char *display = resolve_parent_display(parent_window);
+    int screen = resolve_parent_screen(parent_window);
 
     struct chooser_result result;
-    r = run_filechooser("open-directory",
+    r = run_filechooser("open-directory", app_id,
                         title ? title : "Select Destination",
-                        0, 1, NULL, display, &result);
-    free(display);
+                        0, 1, NULL, screen, &result);
 
     if (r < 0) {
         return sd_bus_error_set(error,
@@ -554,6 +600,9 @@ int main(int argc, char *argv[])
 
     (void)argc;
     (void)argv;
+
+    portal_log("==== xdg-desktop-portal-stellar starting ====");
+    portal_log_env("at startup (main)");
 
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);

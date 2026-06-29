@@ -680,6 +680,11 @@ static void register_awesome_client(
         snprintf(reply, sizeof(reply), "POINTER_SCREEN old=-1 new=%d\n", st->pointer_screen);
         write(c->fd, reply, strlen(reply));
     }
+    
+	// Push the monitor name so AwesomeWM can cache it.
+    char mon_reply[256];
+    snprintf(mon_reply, sizeof(mon_reply), "MONITOR_NAME %s\n", st->screens[screen_num].monitor_name);
+    write(c->fd, mon_reply, strlen(mon_reply));
 
     // Push the cached application menu to this newly-registered Awesome. This
     // is the menu analog of the SETTINGS_RELOADED/picom sync in the HELLO
@@ -844,6 +849,55 @@ static void handle_ipc_line(
 
 		log_info("GET_SCREEN_FOR_DISPLAY '%s' -> screen %d (fd=%d)",
 				 want, found, c->fd);
+		return;
+	}
+
+	if (strncmp(line, "GET_SCREEN_FOR_WINDOW ", 22) == 0) {
+		// Map an X window id to the Stellar screen index that owns it.
+		//
+		// The xdg portal (and any other global helper) is handed an X window
+		// id as the "parent" of a file-chooser request and needs to know which
+		// screen to theme + place the chooser on.  Resolving this here, against
+		// the DE's own ScreenState[].root table from init_x(), is the
+		// authoritative answer: it avoids the client re-deriving the screen by
+		// parsing DISPLAY strings (wrong on non-:0 / Xephyr servers) or by
+		// assuming the X screen index equals the Stellar screen index.
+		//
+		// The parent handed to a portal is frequently a CLIENT window that
+		// AwesomeWM has already reparented under a frame, so its immediate
+		// parent is not one of our screen roots.  XQueryTree fills root_ret
+		// with the window's *screen root* regardless of reparenting, so a
+		// single query resolves it.  A stale / already-destroyed wid makes
+		// XQueryTree trip BadWindow, which x11_error_handler() swallows; the
+		// call then returns 0 and we reply -1.  Reply is one line: index or -1.
+		const char *want = line + 22;
+		while (*want == ' ') want++;   // tolerate extra spaces
+
+		unsigned long wid = 0;
+		int found = -1;
+		if (sscanf(want, "%lu", &wid) == 1 && wid != 0) {
+			Window root_ret = 0, parent_ret = 0, *children = NULL;
+			unsigned int nchildren = 0;
+
+			if (XQueryTree(st->dpy, (Window)wid, &root_ret, &parent_ret,
+			               &children, &nchildren)) {
+				if (children) XFree(children);
+				for (int i = 0; i < st->config.screen_count; i++) {
+					if (st->screens[i].root == root_ret) {
+						found = i;
+						break;
+					}
+				}
+			}
+		}
+
+		char reply[32];
+		int rn = snprintf(reply, sizeof(reply), "%d\n", found);
+		ssize_t wr = write(c->fd, reply, (size_t)rn);
+		(void)wr;
+
+		log_info("GET_SCREEN_FOR_WINDOW '%s' (wid=%lu) -> screen %d (fd=%d)",
+		         want, wid, found, c->fd);
 		return;
 	}
 

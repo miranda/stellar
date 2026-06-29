@@ -186,7 +186,7 @@ local mru_stack = {}
 
 stellar_api.mru_cycle = function(modkey)
 	local cl = client.focus
-	if is_fullscreen_desktop(cl) then 
+	if is_fullscreen_desktop(cl) then
 		if cl.fullscreen then return end
 		client.focus = nil
 		stellar_api.log("Released fullscreen desktop client focus")
@@ -211,6 +211,7 @@ stellar_api.mru_cycle = function(modkey)
 	if c then
 		client.focus = c
 		c:raise()
+		stellar_api.set_active_client(next_c)
 	end
 
 	-- Map the AwesomeWM modifier name to the X11 release keysyms it can produce.
@@ -239,6 +240,7 @@ stellar_api.mru_cycle = function(modkey)
 							final:raise()
 							client.focus = final
 							stellar_api.focus_window(final.window)
+							stellar_api.set_active_client(final.window)
 						end
 					end)
 				end
@@ -259,6 +261,7 @@ stellar_api.mru_cycle = function(modkey)
 			if next_c then
 				client.focus = next_c
 				next_c:raise()
+				stellar_api.set_active_client(next_c)
 			end
 		end
 	end)
@@ -313,6 +316,10 @@ local function load_stellar_settings()
 
     -- Inject Defaults (Strictly checking for 'nil')
     -- If the value is "", it means the user explicitly cleared it in the GUI.
+    if obj.default_placement == nil then
+        obj.default_placement = { "no_overlap", "no_offscreen" }
+    end
+
     if obj.appearance.wallpaper_path == nil then
         local share_path = os.getenv("STELLAR_SHARE_PATH") or "/usr/local/share/stellar"
         obj.appearance.wallpaper_path = share_path .. "/wallpapers/pleiades-blue.jpg"
@@ -685,6 +692,62 @@ local function apply_stellar_settings(new_settings)
 	end
 end
 
+-- Helper to ensure paths don't contain slashes or weird characters
+local function sanitize_name(str)
+    if not str or str == "" then return "unknown" end
+    -- Replace spaces, slashes, and colons with underscores
+    return str:gsub("[%s/\\:]", "_")
+end
+
+local function get_geometry_state_file(c, monitor_edid_name)
+    local state_home = os.getenv("XDG_STATE_HOME")
+    if not state_home or state_home == "" then
+        local home = os.getenv("HOME") or "/tmp"
+        state_home = home .. "/.local/state"
+    end
+
+    local safe_monitor = sanitize_name(monitor_edid_name)
+
+    local identifier
+
+    -- Check if it's a Conflux-managed window by checking its instance name
+    if c.instance and c.instance:match("^stellar_conflux_") then
+        local conflux = require("modules.conflux")
+
+        -- 1. Try to find it in the active workspaces
+        local ws_name = conflux.workspaces[c.instance]
+
+        -- 2. Fallback to pending_spawns if it's just now spawning
+        if not ws_name then
+            ws_name = conflux.pending_spawns[c.instance]
+        end
+
+        if ws_name then
+            identifier = sanitize_name("stellar_conflux_" .. ws_name)
+			stellar_log("conflux: geometry state identifier = " .. identifier)
+        end
+    end
+
+    -- If not a Conflux window (or resolution failed), default to class/role
+    if not identifier then
+        local instance = c.instance or "unknown"
+        local role = c.role or "default"
+        identifier = sanitize_name(instance .. "_" .. role)
+		stellar_log("final geometry state identifier = " .. identifier)
+    end
+
+	if identifier ~= "unknown" then
+		-- Build: ~/.local/state/stellar/awesome/geometry/screen1_MAG275C_QD_E2/
+		local target_dir = string.format("%s/stellar/awesome/geometry/screen%d_%s",
+										 state_home, stellar_screen, safe_monitor)
+
+		gears.filesystem.make_directories(target_dir)
+		stellar_log("final geometry state file path = " .. target_dir .. "/" .. identifier)
+		return target_dir .. "/" .. identifier
+	end
+	return nil
+end
+
 local function install_stellar_hooks(socket_unix)
     local gears = require("gears")
     local awful = require("awful")
@@ -731,6 +794,8 @@ local function install_stellar_hooks(socket_unix)
 	end
 
 	stellar_api.set_active_client = function(c)
+		if is_fullscreen_desktop(c) then return end
+
 		local prev = stellar_api._active_client
 		if prev == c then return end
 		stellar_api.log("set_active_client: " .. tostring(c) .. " (prev=" .. tostring(prev) .. ")")
@@ -983,6 +1048,24 @@ local function install_stellar_hooks(socket_unix)
             return
         end
 
+        -- Initial handshake monitor name
+        local mon_name = line:match("^MONITOR_NAME%s+(.+)$")
+        if mon_name then
+            stellar_api.monitor_name = mon_name
+            stellar_api.log("Cached monitor name: " .. mon_name)
+            return
+        end
+
+        -- Monitor hotplugs/resolution changes
+        local changed_screen, new_name = line:match("^MONITOR_CHANGED%s+screen=(%d+)%s+name=(.+)$")
+        if changed_screen and new_name then
+            if tonumber(changed_screen) == stellar.screen_num then
+                stellar_api.monitor_name = new_name
+                stellar_api.log("Updated monitor name after hotplug: " .. new_name)
+            end
+            return
+        end
+
         local tag_name = line:match("^FOCUS_TAG%s+(.+)$")
         if tag_name then
             local ok, err = pcall(focus_tag_by_name, tag_name)
@@ -1140,38 +1223,58 @@ local function install_stellar_hooks(socket_unix)
 		end
 	end)
 
-
-
     client.connect_signal("manage", function(c)
 -- TODO: change this to set as active client only if normal window w/ titlebars
 		stellar_api.set_active_client(c)
 
-		if c.type == "desktop" and is_fullscreen_desktop(c) then
-			fit_to_screen(c)
-			c._stellar_show_in_tasklist = true
+        if c.type == "desktop" and is_fullscreen_desktop(c) then
+            fit_to_screen(c)
+            c._stellar_show_in_tasklist = true
+        else
+			local edid_name = stellar_api.monitor_name or "Unknown_Monitor"
+			local state_path = get_geometry_state_file(c, edid_name)
+
+			-- ========================================================
+			-- CENTRALIZED PLACEMENT ENGINE
+			-- ========================================================
+			if not c._stellar_placement_handled then
+				local loaded_saved = false
+
+				-- Try to load saved geometry (Only for floating windows)
+				if c.floating or awful.layout.get(c.screen).name == "floating" then
+					local file = io.open(state_path, "r")
+					if file then
+						local content = file:read("*all")
+						file:close()
+						local x, y, w, h = content:match("(%-?%d+),(%-?%d+),(%d+),(%d+)")
+						if x and y and w and h then
+							c:geometry({
+								x = tonumber(x), y = tonumber(y),
+								width = tonumber(w), height = tonumber(h)
+							})
+							loaded_saved = true
+						end
+					end
+				end
+
+				-- Fallback to settings.json defaults for brand new windows
+				if not loaded_saved and not c.fullscreen and not c.maximized then
+					local placement_rules = stellar_api.stellar_settings.default_placement
+					local placement_engine = require("awful.placement")
+
+					for _, rule_name in ipairs(placement_rules) do
+						if placement_engine[rule_name] then
+							placement_engine[rule_name](c, { honor_workarea = true })
+						end
+					end
+				end
+			end
 		end
 
-		if c.class and c.class:match("^term_%d+$") then
-			-- We apply a custom property to mark it for a post-startup fix
-			c._needs_mux_placement_fix = true
-		end
-
-		send_line(
-            "EVENT type=client_manage screen="
-			.. tostring(stellar.screen_num) .. " win=" .. tostring(c.window) .. " class=" .. tostring(c.class or "")
-        )
+        send_line("EVENT type=client_manage screen=" .. tostring(stellar.screen_num) .. " win=" .. tostring(c.window))
     end)
 
     client.connect_signal("unmanage", function(c)
-		if stellar_api._active_client and stellar_api._active_client == c then
-			stellar_api._active_client = nil
-		end
-
-		local previous = awful.client.focus.history.previous()
-		if previous and previous.valid then
-			stellar_api._active_client = previous
-		end
-
 		-- Clean up windows when they are closed so the stack doesn't contain dead clients
 		for i, v in ipairs(mru_stack) do
 			if v == c then
@@ -1180,10 +1283,44 @@ local function install_stellar_hooks(socket_unix)
 			end
 		end
 
-		send_line(
-            "EVENT type=client_unmanage screen="
-			.. tostring(stellar.screen_num) .. " win=" .. tostring(c.window) .. " class=" .. tostring(c.class or "")
-        )
+		-- If the window closing was the active one, fallback securely
+        if stellar_api._active_client == c then
+            local fallback = nil
+
+            -- Scan the MRU stack for the next valid, unminimized window
+            for _, v in ipairs(mru_stack) do
+                if v and v.valid and not v.minimized then
+                    fallback = v
+                    break
+                end
+            end
+
+            -- This cleanly sets the new active client and fires the UI signals.
+            -- If fallback is nil (you closed the last window), it safely clears the state.
+            stellar_api.set_active_client(fallback)
+        end
+
+        -- ========================================================
+        -- GEOMETRY STATE SAVING
+        -- ========================================================
+        if (c.floating or awful.layout.get(c.screen).name == "floating")
+		and not is_fullscreen_desktop(c) then
+            local edid_name = stellar_api.monitor_name or "Unknown_Monitor"
+            local state_path = get_geometry_state_file(c, edid_name)
+			if state_path then
+				local geom = c:geometry()
+				local data = string.format("%d,%d,%d,%d", geom.x, geom.y, geom.width, geom.height)
+
+				local file = io.open(state_path, "w")
+				if file then
+					file:write(data)
+					file:close()
+					stellar_log("writing " .. tostring(c.name) .. "type=" .. c.type .. " fullscreen_desktop=" .. tostring(is_fullscreen_desktop(c)) .. " data=" .. data)
+				end
+			end
+        end
+
+        send_line("EVENT type=client_unmanage screen=" .. tostring(stellar.screen_num) .. " win=" .. tostring(c.window))
     end)
 
 	client.connect_signal("mouse::enter", function(c)
@@ -1287,6 +1424,7 @@ local function install_stellar_hooks(socket_unix)
         )
 	end)
 
+--[[
 	client.connect_signal("property::geometry", function(c)
 		-- If this is a flagged conflux terminal window that just received its real size
 		if c._needs_mux_placement_fix then
@@ -1299,6 +1437,7 @@ local function install_stellar_hooks(socket_unix)
 			awful.placement.no_offscreen(c)
 		end
 	end)
+]]--
 
 	awesome.connect_signal("exit", function(reason_restart)
 		if reason_restart then

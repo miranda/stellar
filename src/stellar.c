@@ -1920,8 +1920,9 @@ static void drain_x_events(StellarState *st) {
                              screen, rr->width, rr->height);
                     monitor_update_screen_info(st, screen);
 
-                    char line[128];
-                    snprintf(line, sizeof(line), "MONITOR_CHANGED screen=%d", screen);
+                    char line[256];
+                    snprintf(line, sizeof(line), "MONITOR_CHANGED screen=%d name=%s",
+							 screen, st->screens[screen].monitor_name);
                     broadcast_line(st, line);
                 }
                 continue;
@@ -1937,8 +1938,9 @@ static void drain_x_events(StellarState *st) {
                              screen, oc->output);
                     monitor_update_screen_info(st, screen);
 
-                    char line[128];
-                    snprintf(line, sizeof(line), "MONITOR_CHANGED screen=%d", screen);
+                    char line[256];
+                    snprintf(line, sizeof(line), "MONITOR_CHANGED screen=%d name=%s",
+							 screen, st->screens[screen].monitor_name);
                     broadcast_line(st, line);
                 }
                 continue;
@@ -2730,6 +2732,9 @@ static void setup_session_env(StellarState *st) {
         snprintf(new_dirs, sizeof(new_dirs), "%s:%s", share_base, data_dirs);
         setenv("XDG_DATA_DIRS", new_dirs, 1);
     }
+
+	setenv("QT_QPA_PLATFORMTHEME", "xdgdesktopportal", 1);
+	setenv("QT_STYLE_OVERRIDE", "kvantum", 1);
 }
 
 static void generate_portal_config(void) {

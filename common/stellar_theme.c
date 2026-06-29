@@ -143,6 +143,66 @@ int stellar_screen_for_display(const char *display) {
     return screen;
 }
 
+// Ask the DE which Stellar screen owns a given X window id.  Like
+// stellar_screen_for_display(), but resolves from the window itself, which is
+// authoritative even when AwesomeWM has reparented the window (the common case
+// for a portal file-chooser parent, where a per-screen DISPLAY suffix would be
+// unavailable or unreliable).  The DE matches the window's screen root against
+// its own ScreenState table.  Returns the screen index (>= 0) on success, or
+// -1 if the window is unknown or the DE is unreachable.
+int stellar_screen_for_window(unsigned long window_id) {
+    if (window_id == 0) return -1;
+
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "GET_SCREEN_FOR_WINDOW %lu", window_id);
+
+    char buf[64];
+    if (stellar_ipc_request(cmd, buf, sizeof(buf), 1000) < 0)
+        return -1;
+
+    // Reply is a single line: the screen index, or -1.
+    int screen = -1;
+    if (sscanf(buf, "%d", &screen) != 1) return -1;
+    return screen;
+}
+
+void make_screen_display_name(
+    const char *display_str,
+    int screen_num,
+    char *out,
+    size_t out_sz
+) {
+    if (!display_str || !out || out_sz == 0) {
+        return;
+    }
+
+    /*
+     * X display strings are generally:
+     *   hostname:display
+     *   hostname:display.screen
+     *   :display
+     *   :display.screen
+     *
+     * We want to preserve hostname/display, but replace the screen suffix.
+     */
+    char base[256];
+    snprintf(base, sizeof(base), "%s", display_str);
+
+    char *last_colon = strrchr(base, ':');
+    if (!last_colon) {
+        /* Fallback: if format is weird, just use as-is and append screen */
+        snprintf(out, out_sz, "%s.%d", base, screen_num);
+        return;
+    }
+
+    char *dot_after_colon = strchr(last_colon, '.');
+    if (dot_after_colon) {
+        *dot_after_colon = '\0';
+    }
+
+    snprintf(out, out_sz, "%s.%d", base, screen_num);
+}
+
 /* ---------- Appearance (font) request ---------- */
 
 int request_appearance(int screen_num, ThemeData *out) {
@@ -200,7 +260,7 @@ int request_appearance(int screen_num, ThemeData *out) {
         // Clean call! The API now handles the pt/px math internally.
         if (stellar_font_resolve(out->font, out->font_size, out->font_unit, out->dpi, &fi) == 0) {
             snprintf(out->font_path, sizeof(out->font_path), "%s", fi.path);
-            out->font_size = fi.size_px; 
+            out->font_size = fi.size_px;
             snprintf(out->font_unit, sizeof(out->font_unit), "px"); // Lock to px for Cairo
             out->font_is_bitmap = fi.is_bitmap;
         }
@@ -337,10 +397,10 @@ int request_theme_data(int screen_num, ThemeData *out) {
     if (request_appearance(screen_num, out) != 0 &&
         out->font_path[0] == '\0' && out->font[0] != '\0') {
         StellarFontInfo fi;
-        
+
         // Safely determine the unit, defaulting to "pt" if nothing is set
         const char *unit = (out->font_unit[0] != '\0') ? out->font_unit : "pt";
-        
+
         // Pass the unit parameter to the updated resolver
         if (stellar_font_resolve(out->font, out->font_size, unit, out->dpi, &fi) == 0) {
             snprintf(out->font_path, sizeof(out->font_path), "%s", fi.path);

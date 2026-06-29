@@ -101,6 +101,9 @@ struct file_browser {
     char input_name[MAX_PATH_LEN];
 	int selected_item;
 
+    int confirm_overwrite;
+    char last_input_name[MAX_PATH_LEN];
+
 	/* directory content */
     char **files;
     char **directories;
@@ -294,7 +297,55 @@ int cmp_fn(const void *str1, const void *str2)
     const char *str2_ret = *(const char **)str2;
     return nk_stricmp(str1_ret, str2_ret);
 }
- 
+
+static const char *get_user_home_dir(void) {
+    const char *home = getenv("HOME");
+    if (home && home[0] != '\0') {
+        return home;
+    }
+
+    struct passwd *pw = getpwuid(getuid());
+    if (pw && pw->pw_dir && pw->pw_dir[0] != '\0') {
+        return pw->pw_dir;
+    }
+
+    return NULL;
+}
+
+static void get_state_file_path(char *buffer, size_t max_len, const char *app_id) {
+    const char *state_home = getenv("XDG_STATE_HOME");
+    
+    // Build the base path up to /stellar
+    if (state_home && state_home[0] != '\0') {
+        snprintf(buffer, max_len, "%s/stellar", state_home);
+    } else {
+        const char *home = get_user_home_dir();
+        snprintf(buffer, max_len, "%s/.local/state/stellar", home);
+    }
+    
+    // Ensure the base stellar directory exists
+    if (mkdir(buffer, 0700) != 0 && errno != EEXIST) {
+        fprintf(stderr, "Failed to create %s: %s", buffer, strerror(errno));
+    }
+
+    // Append /fileselect safely (avoiding snprintf overlap)
+    size_t len = strlen(buffer);
+    snprintf(buffer + len, max_len - len, "/fileselect");
+    
+    // Ensure the fileselect subdirectory exists
+    if (mkdir(buffer, 0700) != 0 && errno != EEXIST) {
+        fprintf(stderr, "Failed to create %s: %s", buffer, strerror(errno));
+    }
+
+    // Append the final text file name
+    len = strlen(buffer);
+    if (app_id && app_id[0] != '\0') {
+        snprintf(buffer + len, max_len - len, "/%s", app_id);
+    } else {
+        snprintf(buffer + len, max_len - len, "/global");
+    }
+}
+
 static void file_browser_reload_directory_content(struct file_browser *browser, const char *path)
 {
     strncpy(browser->directory, path, MAX_PATH_LEN);
@@ -302,6 +353,7 @@ static void file_browser_reload_directory_content(struct file_browser *browser, 
 
     // Clear selection state
     browser->selected_item = -1;
+	browser->confirm_overwrite = 0;
 
     dir_free_list(browser->files, browser->file_count);
     dir_free_list(browser->directories, browser->dir_count);
@@ -318,7 +370,7 @@ static void file_browser_reload_directory_content(struct file_browser *browser, 
     }
 }
 
-static void file_browser_init(struct file_browser *browser, struct media *media)
+static void file_browser_init(struct file_browser *browser, struct media *media, const char *app_id)
 {
     const char *home;
     size_t l;
@@ -326,22 +378,54 @@ static void file_browser_init(struct file_browser *browser, struct media *media)
     memset(browser, 0, sizeof(*browser));
     browser->media = media;
 
-    /* load files and sub-directory list */
-    home = getenv("HOME");
-    if (!home) home = getpwuid(getuid())->pw_dir;
+    home = get_user_home_dir();
 
     strncpy(browser->home, home, MAX_PATH_LEN);
     browser->home[MAX_PATH_LEN - 1] = 0;
     l = strlen(browser->home);
     strcpy(browser->home + l, "/");
-    strcpy(browser->directory, browser->home);
 
     strcpy(browser->desktop, browser->home);
     l = strlen(browser->desktop);
     strcpy(browser->desktop + l, "desktop/");
 
+    // Try to read the last known directory
+    char state_path[MAX_PATH_LEN];
+    get_state_file_path(state_path, sizeof(state_path), app_id);
+    
+    FILE *f = fopen(state_path, "r");
+    int loaded_state = 0;
+    
+    if (f) {
+        if (fgets(browser->directory, MAX_PATH_LEN, f)) {
+            // Strip trailing newline
+            browser->directory[strcspn(browser->directory, "\n")] = 0;
+            
+            // Validate the directory actually still exists
+            DIR *dir = opendir(browser->directory);
+            if (dir) {
+                closedir(dir);
+                loaded_state = 1;
+            }
+        }
+        fclose(f);
+    }
+
+    // If we couldn't load a valid state, default to home
+    if (!loaded_state) {
+        strcpy(browser->directory, browser->home);
+    }
+
     browser->files = dir_list(browser->directory, 0, &browser->file_count);
     browser->directories = dir_list(browser->directory, 1, &browser->dir_count);
+
+    // Sort the directory arrays on initial load
+    if (browser->file_count > 0) {
+        qsort(browser->files, browser->file_count, sizeof(char *), cmp_fn);
+    }
+    if (browser->dir_count > 0) {
+        qsort(browser->directories, browser->dir_count, sizeof(char *), cmp_fn);
+    }
 }
 
 static void file_browser_free(struct file_browser *browser)
@@ -425,7 +509,7 @@ static int file_browser_run(struct file_browser *browser, struct nk_context *ctx
                     int is_selected = (browser->selected_item == (int)j); 
                     
                     nk_layout_row(ctx, NK_DYNAMIC, 30, 2, ratio2);
-                    nk_label(ctx, "[FILE]", NK_TEXT_LEFT);
+                    nk_label(ctx, "", NK_TEXT_LEFT);
                     
                     // If clicked, update the selection tracker and text box
                     if (nk_selectable_label(ctx, browser->files[j], NK_TEXT_LEFT, &is_selected)) {
@@ -452,25 +536,50 @@ static int file_browser_run(struct file_browser *browser, struct nk_context *ctx
         // --- Always visible bottom bar ---
         nk_layout_row_dynamic(ctx, 30, 2);
         nk_label(ctx, "File Name:", NK_TEXT_LEFT);
+
+        // Reset the overwrite warning if the user starts modifying the filename
+        if (browser->confirm_overwrite) {
+            if (strcmp(browser->input_name, browser->last_input_name) != 0) {
+                browser->confirm_overwrite = 0;
+            }
+        }
+
         nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, browser->input_name, MAX_PATH_LEN, nk_filter_default);
 
         nk_layout_row_dynamic(ctx, 30, 4);
-        nk_label(ctx, "", NK_TEXT_LEFT); 
+        
+        // Show warning label in column 1 if we are in the confirm state
+        if (browser->confirm_overwrite) {
+            nk_label(ctx, "File exists!", NK_TEXT_LEFT); 
+        } else {
+            nk_label(ctx, "", NK_TEXT_LEFT); 
+        }
         nk_label(ctx, "", NK_TEXT_LEFT); 
         
         if (nk_button_label(ctx, "Cancel")) {
             ret = -1;
         }
 
-        const char *action_label = is_save_mode ? "Save" : (is_dir_mode ? "Select Directory" : "Open");
+        const char *action_label = is_save_mode ? (browser->confirm_overwrite ? "Overwrite" : "Save") : (is_dir_mode ? "Select Directory" : "Open");
+        
         if (nk_button_label(ctx, action_label)) {
             if (is_dir_mode) {
                 strncpy(browser->file, browser->directory, MAX_PATH_LEN);
                 ret = 1;
             } else {
                 if (strlen(browser->input_name) > 0) {
-                    snprintf(browser->file, MAX_PATH_LEN, "%s%s", browser->directory, browser->input_name);
-                    ret = 1;
+                    char temp_path[MAX_PATH_LEN];
+                    snprintf(temp_path, MAX_PATH_LEN, "%s%s", browser->directory, browser->input_name);
+
+                    if (is_save_mode && !browser->confirm_overwrite && access(temp_path, F_OK) == 0) {
+                        // First click on Save: File exists, trap the state and wait for second click
+                        browser->confirm_overwrite = 1;
+                        strncpy(browser->last_input_name, browser->input_name, MAX_PATH_LEN);
+                    } else {
+                        // Either not save mode, file doesn't exist, or we are on the second Overwrite click
+                        strncpy(browser->file, temp_path, MAX_PATH_LEN);
+                        ret = 1;
+                    }
                 }
             }
         }
@@ -498,12 +607,16 @@ int main(int argc, char *argv[])
     int allow_multiple = 0;
     char window_title[256] = "File Select";
     char initial_name[MAX_PATH_LEN] = {0};
+    char app_id[256] = {0};
 
     // Parse the arguments sent by xdg_portal.c
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             if (strcmp(argv[i+1], "save") == 0) is_save_mode = 1;
             if (strcmp(argv[i+1], "open-directory") == 0) is_dir_mode = 1;
+            i++;
+        } else if (strcmp(argv[i], "--app-id") == 0 && i + 1 < argc) { 
+            strncpy(app_id, argv[i+1], sizeof(app_id) - 1);
             i++;
         } else if (strcmp(argv[i], "--title") == 0 && i + 1 < argc) {
             strncpy(window_title, argv[i+1], sizeof(window_title) - 1);
@@ -565,7 +678,7 @@ int main(int argc, char *argv[])
     struct file_browser browser;
     struct media media;
     memset(&media, 0, sizeof(media)); // Since we stripped icons, just zero it out safely
-    file_browser_init(&browser, &media);
+    file_browser_init(&browser, &media, app_id);
 
     // Inject initial name
     if (initial_name[0] != '\0') {
@@ -685,6 +798,18 @@ int main(int argc, char *argv[])
             nk_clear(ctx);
 
             need_redraw = 0;
+        }
+    }
+
+    if (strlen(selected_filepath) > 0) {
+        // Save the directory to state memory
+        char state_path[MAX_PATH_LEN];
+        get_state_file_path(state_path, sizeof(state_path), app_id);
+
+        FILE *f = fopen(state_path, "w");
+        if (f) {
+            fputs(browser.directory, f);
+            fclose(f);
         }
     }
 

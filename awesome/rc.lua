@@ -555,8 +555,8 @@ ruled.client.connect_signal("request::rules", function()
         properties = {
             focus     = awful.client.focus.filter,
             raise     = true,
-            screen    = awful.screen.preferred,
-            placement = awful.placement.no_overlap+awful.placement.no_offscreen
+            screen    = awful.screen.preferred
+--            placement = awful.placement.no_overlap+awful.placement.no_offscreen
         }
     }
 

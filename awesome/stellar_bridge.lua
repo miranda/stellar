@@ -133,7 +133,10 @@ awesome.register_xproperty("_STELLAR_SIMPLE_DECORATIONS", "boolean")
 awesome.register_xproperty("_STELLAR_FULLSCREEN_DESKTOP", "boolean")
 
 awesome.connect_signal("debug::error", function(err)
-    stellar_log("ERROR: " .. tostring(err))
+	-- err may be a string OR a table/object; normalise it
+	local msg = type(err) == "table" and (err.message or err.msg) or tostring(err)
+	stellar_log("ERROR: " .. tostring(msg))
+	stellar_log("TRACEBACK:\n" .. debug.traceback("", 2))
 end)
 
 awesome.connect_signal("debug::deprecation", function(msg)
@@ -197,8 +200,8 @@ stellar_api.mru_cycle = function(modkey)
 	-- Create a static snapshot of valid clients for the current screen
 	local cycle_list = {}
 	for _, c in ipairs(mru_stack) do
-		-- Filter out minimized and hidden windows
-		if not c.minimized and not c.hidden then
+		-- Filter out minimized, hidden, and dead clients
+		if c and c.valid and not c.minimized and not c.hidden then
 			table.insert(cycle_list, c)
 		end
 	end
@@ -211,7 +214,7 @@ stellar_api.mru_cycle = function(modkey)
 	if c then
 		client.focus = c
 		c:raise()
-		stellar_api.set_active_client(next_c)
+		stellar_api.set_active_client(c)
 	end
 
 	-- Map the AwesomeWM modifier name to the X11 release keysyms it can produce.
@@ -240,7 +243,7 @@ stellar_api.mru_cycle = function(modkey)
 							final:raise()
 							client.focus = final
 							stellar_api.focus_window(final.window)
-							stellar_api.set_active_client(final.window)
+							stellar_api.set_active_client(final)
 						end
 					end)
 				end
@@ -1033,15 +1036,16 @@ local function install_stellar_hooks(socket_unix)
 					stellar_api._active_client:emit_signal("property::stellar_active")
     			end
 
-                -- Cancel the run prompt if it is active
-                if _G.cancel_run_prompt then
-                    _G.cancel_run_prompt()
-                end
-
-				-- Cancel the desktop context menu if it is active
-				if _G.cancel_desktop_menu then
-					_G.cancel_desktop_menu()
-				end
+                -- The pointer left this screen entirely (e.g. swiped onto
+                -- another monitor in zaphodheads). That is NOT a widget
+                -- mouse::leave, so any transient popup keyed off mouse::leave
+                -- would stick open. Broadcast a process-wide signal so every
+                -- such popup (run prompt, desktop menu, layout chooser, window
+                -- titlebar popups, ...) can dismiss itself the same way it
+                -- would on mouse::leave. Modules subscribe via
+                --   awesome.connect_signal("stellar::pointer_left_screen", fn)
+                -- and receive (old_screen, new_screen).
+                awesome.emit_signal("stellar::pointer_left_screen", old_s, new_s)
 			end
 
             -- We do absolutely nothing when leaving. AwesomeWM keeps its memory naturally!
@@ -1223,6 +1227,31 @@ local function install_stellar_hooks(socket_unix)
 		end
 	end)
 
+	stellar_api.load_client_geometry = function(c)
+		if not c or not c.valid or is_fullscreen_desktop(c) then return false end
+
+		local edid_name = stellar_api.monitor_name or "Unknown_Monitor"
+		local state_path = get_geometry_state_file(c, edid_name)
+
+		if state_path and (c.floating or awful.layout.get(c.screen).name == "floating") then
+			local file = io.open(state_path, "r")
+			if file then
+				local content = file:read("*all")
+				file:close()
+				local x, y, w, h = content:match("(%-?%d+),(%-?%d+),(%d+),(%d+)")
+				if x and y and w and h then
+					local saved_geo = {
+						x = tonumber(x), y = tonumber(y),
+						width = tonumber(w), height = tonumber(h)
+					}
+					c:geometry(saved_geo)
+					return saved_geo
+				end
+			end
+		end
+		return false
+	end
+
     client.connect_signal("manage", function(c)
 -- TODO: change this to set as active client only if normal window w/ titlebars
 		stellar_api.set_active_client(c)
@@ -1241,19 +1270,58 @@ local function install_stellar_hooks(socket_unix)
 				local loaded_saved = false
 
 				-- Try to load saved geometry (Only for floating windows)
-				if c.floating or awful.layout.get(c.screen).name == "floating" then
-					local file = io.open(state_path, "r")
-					if file then
-						local content = file:read("*all")
-						file:close()
-						local x, y, w, h = content:match("(%-?%d+),(%-?%d+),(%d+),(%d+)")
-						if x and y and w and h then
-							c:geometry({
-								x = tonumber(x), y = tonumber(y),
-								width = tonumber(w), height = tonumber(h)
-							})
-							loaded_saved = true
+				local saved_geo = stellar_api.load_client_geometry(c)
+				if saved_geo then
+					loaded_saved = true
+
+					-- Check if this is a Conflux window
+					local is_conflux = c.instance and c.instance:match("^stellar_conflux_")
+
+					-- Enforce-once guard. Some clients (e.g. Lutris)
+					-- re-assert their own remembered position shortly
+					-- after mapping, via a path that does NOT come
+					-- through request::geometry -- so the move only shows
+					-- up as property::geometry, which fires AFTER the
+					-- position already changed. We watch for the first
+					-- such deviation, snap it back to saved_geo once, then
+					-- disarm and let the window move freely thereafter.
+					--
+					-- Only clients that actually restored a saved
+					-- geometry arm this. Brand-new windows never do, so
+					-- their default placement is untouched.
+					if not is_conflux then
+						c._stellar_geom_guard = saved_geo
+
+						local function enforce_once(cl)
+							if not cl._stellar_geom_guard then return end
+							local g = cl._stellar_geom_guard
+							-- Disarm first so our own :geometry() call below
+							-- (which re-fires property::geometry) doesn't recurse.
+							cl._stellar_geom_guard = nil
+							cl:disconnect_signal("property::geometry", enforce_once)
+
+							local cur = cl:geometry()
+							if cur.x ~= g.x or cur.y ~= g.y
+								or cur.width ~= g.width or cur.height ~= g.height then
+								cl:geometry(g)
+								stellar_log("geom guard: overrode self-reposition of "
+									.. tostring(cl.class) .. " back to saved "
+									.. string.format("%d,%d,%d,%d", g.x, g.y, g.width, g.height))
+							end
 						end
+
+						c:connect_signal("property::geometry", enforce_once)
+
+						-- Safety net: if the client never repositions itself,
+						-- drop the guard so a much later legitimate move isn't
+						-- caught. Disarming is idempotent with enforce_once.
+						gears.timer.start_new(4.0, function()
+							if c.valid and c._stellar_geom_guard then
+								c._stellar_geom_guard = nil
+								c:disconnect_signal("property::geometry", enforce_once)
+							end
+							return false
+						end)
 					end
 				end
 
@@ -1273,6 +1341,34 @@ local function install_stellar_hooks(socket_unix)
 
         send_line("EVENT type=client_manage screen=" .. tostring(stellar.screen_num) .. " win=" .. tostring(c.window))
     end)
+
+	stellar_api.save_client_geometry = function(c, force_conflux)
+		-- Conflux geometry is normally saved explicitly from
+		-- conflux.kill_workspace(), which passes force_conflux=true. The
+		-- automatic unmanage path must NOT save conflux windows (the workspace
+		-- mapping is already being torn down and geometry resolution is
+		-- unreliable there), so it calls without the flag and we bail here.
+		if c.instance and c.instance:match("^stellar_conflux_") and not force_conflux then
+			return
+		end
+
+        if (c.floating or awful.layout.get(c.screen).name == "floating")
+		and not is_fullscreen_desktop(c) then
+            local edid_name = stellar_api.monitor_name or "Unknown_Monitor"
+            local state_path = get_geometry_state_file(c, edid_name)
+			if state_path then
+				local geom = c:geometry()
+				local data = string.format("%d,%d,%d,%d", geom.x, geom.y, geom.width, geom.height)
+
+				local file = io.open(state_path, "w")
+				if file then
+					file:write(data)
+					file:close()
+					stellar_log("writing " .. tostring(c.name) .. "type=" .. c.type .. " fullscreen_desktop=" .. tostring(is_fullscreen_desktop(c)) .. " data=" .. data)
+				end
+			end
+        end
+	end
 
     client.connect_signal("unmanage", function(c)
 		-- Clean up windows when they are closed so the stack doesn't contain dead clients
@@ -1300,25 +1396,7 @@ local function install_stellar_hooks(socket_unix)
             stellar_api.set_active_client(fallback)
         end
 
-        -- ========================================================
-        -- GEOMETRY STATE SAVING
-        -- ========================================================
-        if (c.floating or awful.layout.get(c.screen).name == "floating")
-		and not is_fullscreen_desktop(c) then
-            local edid_name = stellar_api.monitor_name or "Unknown_Monitor"
-            local state_path = get_geometry_state_file(c, edid_name)
-			if state_path then
-				local geom = c:geometry()
-				local data = string.format("%d,%d,%d,%d", geom.x, geom.y, geom.width, geom.height)
-
-				local file = io.open(state_path, "w")
-				if file then
-					file:write(data)
-					file:close()
-					stellar_log("writing " .. tostring(c.name) .. "type=" .. c.type .. " fullscreen_desktop=" .. tostring(is_fullscreen_desktop(c)) .. " data=" .. data)
-				end
-			end
-        end
+		stellar_api.save_client_geometry(c)
 
         send_line("EVENT type=client_unmanage screen=" .. tostring(stellar.screen_num) .. " win=" .. tostring(c.window))
     end)

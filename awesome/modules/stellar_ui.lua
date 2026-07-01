@@ -397,6 +397,21 @@ function sui.hover_popup(args)
     popup:connect_signal("mouse::enter", function() hide_timer:stop() end)
     popup:connect_signal("mouse::leave", function() hide_timer:again() end)
 
+    -- Cross-screen dismissal (zaphodheads). When the pointer leaves this X
+    -- screen entirely - e.g. swiped onto another monitor - no widget
+    -- mouse::leave fires, so without this the popup sticks open. stellar_bridge
+    -- broadcasts "stellar::pointer_left_screen" on the process bus for exactly
+    -- this case; treat it like a mouse::leave that we KNOW should hide us, so
+    -- hide immediately rather than starting the grace timer (the pointer is
+    -- already gone; there is nothing to re-enter). Every popup built through
+    -- hover_popup - tab menu, window-button popup, layout chooser - gets this
+    -- for free.
+    local function on_pointer_left_screen()
+        hide_timer:stop()
+        popup.visible = false
+    end
+    awesome.connect_signal("stellar::pointer_left_screen", on_pointer_left_screen)
+
     local obj = {
         popup = popup,
         timer = hide_timer,
@@ -419,6 +434,9 @@ function sui.hover_popup(args)
     function obj:destroy()
         popup.visible = false
         hide_timer:stop()
+        -- Disconnect the bus subscription so per-client popups (window
+        -- titlebars) don't leak a handler when their client goes away.
+        awesome.disconnect_signal("stellar::pointer_left_screen", on_pointer_left_screen)
     end
 
     return obj

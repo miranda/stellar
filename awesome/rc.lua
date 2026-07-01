@@ -13,6 +13,7 @@ local wibox = require("wibox")
 local stellar_menu = require("modules.stellar_menu")
 local stalonetray = require("modules.stalonetray")
 local conflux = require("modules.conflux")
+local stellar_layoutbox = require("modules.stellar_layoutbox")
 -- Theme handling library
 local beautiful = require("beautiful")
 -- Notification library
@@ -159,7 +160,8 @@ screen.connect_signal("request::desktop_decoration", function(s)
 
     -- Create an imagebox widget which will contain an icon indicating which layout we're using.
     -- We need one layoutbox per screen.
-    s.mylayoutbox = awful.widget.layoutbox {
+--[[
+	s.mylayoutbox = awful.widget.layoutbox {
         screen  = s,
         buttons = {
             awful.button({ }, 1, function () awful.layout.inc( 1) end),
@@ -168,6 +170,8 @@ screen.connect_signal("request::desktop_decoration", function(s)
 --            awful.button({ }, 5, function () awful.layout.inc( 1) end),
         }
     }
+]]--
+	s.mylayoutbox = stellar_layoutbox(s)
 
     -- Create a taglist widget
     s.mytaglist = awful.widget.taglist {
@@ -234,22 +238,20 @@ end)
 
 -- }}}
 
-_G.cancel_desktop_menu = nil
+-- The pointer leaving this screen (e.g. swiping onto another monitor in
+-- zaphodheads) is not a mouse event the menu sees, so it would stay open.
+-- Subscribe to stellar_bridge's process-wide signal and hide the menu if it's
+-- currently up. This replaces the old armed _G.cancel_desktop_menu global.
+awesome.connect_signal("stellar::pointer_left_screen", function()
+    if mymainmenu and mymainmenu.wibox and mymainmenu.wibox.visible then
+        mymainmenu:hide()
+    end
+end)
+
 -- {{{ Mouse bindings
 awful.mouse.append_global_mousebindings({
     awful.button({ }, 3, function ()
 		mymainmenu:toggle()
-
-        if mymainmenu.wibox.visible then
-            -- Menu just opened, arm the canceller
-            _G.cancel_desktop_menu = function()
-                mymainmenu:hide()
-                _G.cancel_desktop_menu = nil
-            end
-        else
-            -- Menu just closed normally, disarm
-            _G.cancel_desktop_menu = nil
-        end
 	end),
 --    awful.button({ }, 4, awful.tag.viewprev),
 --    awful.button({ }, 5, awful.tag.viewnext),
@@ -298,13 +300,9 @@ awful.keyboard.append_global_keybindings({
             -- 1. Capture the exact widget right now, while this screen definitely has focus
             local prompt_widget = awful.screen.focused().mypromptbox.widget
 
-            -- 2. Create our bulletproof cancellation function
-            _G.cancel_run_prompt = function()
-			    local esc_keycode = awful.key.keygroups["Escape"] or 9  -- evdev standard
-				root.fake_input("key_press",   esc_keycode)
-				root.fake_input("key_release", esc_keycode)
-				_G.cancel_run_prompt = nil
-            end
+            -- 2. Mark the prompt active so the cross-screen handler knows to
+            --    dismiss it (see the subscriber just below this keybinding block).
+            _G.run_prompt_active = true
 
             -- 3. Launch the prompt
             awful.prompt.run {
@@ -320,9 +318,9 @@ awful.keyboard.append_global_keybindings({
                         prompt_widget:set_text(err)
                     end
                 end,
-                -- 4. If the prompt closes normally (Enter or Esc), remove our custom function
+                -- 4. When the prompt closes normally (Enter or Esc), clear the flag
                 done_callback = function()
-                    _G.cancel_run_prompt = nil
+                    _G.run_prompt_active = false
                 end,
                 completion_callback = awful.completion.shell,
                 history_path = gears.filesystem.get_cache_dir() .. "/history"
@@ -343,6 +341,20 @@ awful.keyboard.append_global_keybindings({
 		{description = "force-unmaximize a window", group = "client"})
 ]]--
 })
+
+-- Dismiss the run prompt when the pointer leaves this screen (zaphodheads
+-- swipe onto another monitor). awful.prompt has no "cancel" API, so we fake an
+-- Escape keypress - but only when a prompt is actually open, so a screen-cross
+-- never eats an unrelated Escape. This replaces the old armed
+-- _G.cancel_run_prompt global; the keybinding above just sets/clears the flag.
+awesome.connect_signal("stellar::pointer_left_screen", function()
+    if _G.run_prompt_active then
+        local esc_keycode = awful.key.keygroups["Escape"] or 9  -- evdev standard
+        root.fake_input("key_press",   esc_keycode)
+        root.fake_input("key_release", esc_keycode)
+        -- done_callback will flip run_prompt_active back to false.
+    end
+end)
 
 -- Tags related keybindings
 awful.keyboard.append_global_keybindings({

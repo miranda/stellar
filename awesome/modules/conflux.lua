@@ -340,7 +340,7 @@ end
 -- @param workspace_name string The ID of the workspace group
 -- @param nuke_sessions boolean If true, also terminates the underlying atch sessions
 -- @return table The instance names that were terminated
-function conflux.kill_workspace(workspace_name, nuke_sessions)
+function conflux.kill_workspace(workspace_name, active_tab_client, nuke_sessions)
     if not workspace_name and workspace_name ~= "" then return {} end
 
     local instancees = {}
@@ -360,7 +360,17 @@ function conflux.kill_workspace(workspace_name, nuke_sessions)
     local clients_to_kill = {}
     for _, instance_name in ipairs(instancees) do
         local c = conflux.find_client_for_workspace(instance_name)
-        
+
+        -- Save the geometry for the client that was clicked on BEFORE we
+        -- unregister it below. get_geometry_state_file() resolves the target
+        -- filename from conflux.workspaces[c.instance]; if we niled that first,
+        -- the save would fall through to a per-instance junk filename (or fail
+        -- to resolve), which is why conflux geometry stopped persisting to the
+        -- shared stellar_conflux_<workspace> file.
+        if c and c.valid and c == active_tab_client then
+            stellar_api.save_client_geometry(c, true)
+        end
+
         -- Unregister from the internal table
         conflux.workspaces[instance_name] = nil
 
@@ -731,12 +741,18 @@ function conflux.detach_tab(instance_name)
         end
     end
 
-    -- Re-apply standard placement so the detached window lands in a natural
-    -- position like a freshly spawned window, rather than sitting on top of
-    -- the group it just left.
+    -- Attempt to load saved geometry for the new workspace.
+    -- If none exists, fall back to natural placement.
     if target_c.valid then
-        awful.placement.no_overlap(target_c)
-        awful.placement.no_offscreen(target_c)
+        local loaded = false
+        if stellar_api and stellar_api.load_client_geometry then
+            loaded = stellar_api.load_client_geometry(target_c)
+        end
+        
+        if not loaded then
+            awful.placement.no_overlap(target_c)
+            awful.placement.no_offscreen(target_c)
+        end
     end
 end
 
@@ -745,6 +761,23 @@ end
 function conflux.terminate_tab(instance_name)
     local c = conflux.find_client_for_workspace(instance_name)
     if not c or not c.valid then return end
+
+    -- If this is the last tab in its workspace, terminating it closes the whole
+    -- window, so persist its geometry (same as the whole-window close path).
+    local workspace_name = conflux.workspaces[instance_name]
+        or c:get_xproperty("_STELLAR_CONFLUX_WORKSPACE")
+    if workspace_name and workspace_name ~= "" then
+        local sibling_count = 0
+        for inst, ws in pairs(conflux.workspaces) do
+            if ws == workspace_name and inst ~= instance_name then
+                sibling_count = sibling_count + 1
+            end
+        end
+        if sibling_count == 0 then
+            stellar_api.save_client_geometry(c, true)
+        end
+    end
+
 	conflux.activate_tab(instance_name)
     c:kill()
 end
@@ -779,19 +812,29 @@ client.connect_signal("request::rules", function(c)
     if c.instance and c.instance:match("^stellar_conflux_") then
     	stellar_api.log("conflux: request::rules triggered, class=" .. c.class .. " instance=" .. c.instance)
         
-        -- Apply the Picom anti-fade brand instantly if this is a new tab
-		-- TODO: fix visual glitch from disabling fading, or remove this custom xproperty entirely
         local target_workspace = conflux.pending_spawns[c.instance]
-        if target_workspace then
+        local existing_workspace = c:get_xproperty("_STELLAR_CONFLUX_WORKSPACE")
+        local ws = target_workspace or existing_workspace
+
+        if ws then
+            local has_siblings = false
+            
             for instance_name, ws_name in pairs(conflux.workspaces) do
-                if ws_name == target_workspace and instance_name ~= c.instance then
+                if ws_name == ws and instance_name ~= c.instance then
+                    has_siblings = true
+                    
                     local other_c = conflux.find_client_for_workspace(instance_name)
                     if other_c and not other_c.hidden then
                         -- A visible tab already exists. Brand the new window before it maps!
                         c:set_xproperty("_STELLAR_NO_FADE", true)
-                        break
                     end
                 end
+            end
+
+            -- If the workspace already has other tabs, we will copy their geometry 
+            -- dynamically in the `manage` signal. Tell stellar_bridge not to load from disk.
+            if has_siblings then
+                c._stellar_placement_handled = true
             end
         end
     end

@@ -417,7 +417,15 @@ end
 local function update_tab_bar(c, slice_data, frame_buttons)
     if not c or not c.valid then return end
 
-    local current_workspace = conflux.workspaces[c.instance]
+	-- Resolve this client's group from the authoritative live X11 property first,
+	-- falling back to the in-memory table only if the property isn't set yet. The
+	-- xproperty is the ground truth for which group the window actually belongs to;
+	-- trusting conflux.workspaces[c.instance] alone meant that any ambiguity in the
+	-- instance string (now fixed at the source) rendered the wrong group's tabs.
+	local current_workspace = c:get_xproperty("_STELLAR_CONFLUX_WORKSPACE")
+	if not current_workspace or current_workspace == "" then
+		current_workspace = conflux.workspaces[c.instance]
+	end
     if not current_workspace then return end
 
     local tabs = conflux.get_tab_order(current_workspace)
@@ -443,7 +451,19 @@ local function update_tab_bar(c, slice_data, frame_buttons)
 
             new_button = {
                 on_click = function()
-                    conflux.spawn_new(current_workspace)
+					-- Resolve the target group LIVE at click time, not from the
+					-- value captured when this strip was first built. The strip is
+					-- created once per client and never rebuilt, so a captured
+					-- workspace name goes stale after detach_tab reassigns this
+					-- client to a new group - which made the new tab land on the
+					-- client's original workspace instead of the detached one.
+					local target_ws = c.valid
+						and c:get_xproperty("_STELLAR_CONFLUX_WORKSPACE")
+						or nil
+					if not target_ws or target_ws == "" then
+						target_ws = conflux.workspaces[c.instance]
+					end
+					conflux.spawn_new(target_ws)
                     if active_outline_client then
                         hide_outline(active_outline_client)
                     end
@@ -628,7 +648,6 @@ end
 
 function M.setup()
     local slice_data = stellar_ui.load_slice_data(stellar_api.theme_assets_path)
-	local floating_geometries = {}
 
     -- Per-client pending updates. Most events only need to refresh the client they fire on.
     -- pending_full_sweep is set for events with cross-client side effects (layout change,
@@ -706,8 +725,8 @@ function M.setup()
 
 		local layout = awful.layout.get(c.screen)
 		-- If the layout is floating, but the window technically isn't, track its real position
-		if layout == awful.layout.suit.floating and not c.floating then
-			floating_geometries[c] = c:geometry()
+		if c.floating or layout == awful.layout.suit.floating then
+			c._saved_floating_geom = c:geometry()
 		end
     end)
 
@@ -751,7 +770,6 @@ function M.setup()
 
     client.connect_signal("unmanage", function(c)
 		queue_update(c)
-		floating_geometries[c] = nil
 	end)
 
 	client.connect_signal("property::stellar_active", function(c)
@@ -763,7 +781,7 @@ function M.setup()
 
 	-- Layout changes affect every client on the tag (tiled_clients count flips can
 	-- ripple across windows), so do a full sweep.
-	tag.connect_signal("property::layout", queue_sweep)
+--	tag.connect_signal("property::layout", queue_sweep)
     client.connect_signal("property::maximized", evaluate_state)
     client.connect_signal("property::fullscreen", evaluate_state)
     client.connect_signal("property::ontop", queue_update)
@@ -776,7 +794,7 @@ function M.setup()
 		local layout = awful.layout.get(c.screen)
 		-- If the window is toggled to floating while in a floating layout
 		if layout == awful.layout.suit.floating and c.floating then
-			local geom = floating_geometries[c]
+			local geom = c._saved_floating_geom
 			if geom then
 				-- Use delayed_call to apply our saved geometry *after* AwesomeWM applies the stale one
 				gears.timer.delayed_call(function()
@@ -786,6 +804,29 @@ function M.setup()
 				end)
 			end
 		end
+	end)
+
+	tag.connect_signal("property::layout", function(t)
+		-- Only trigger when switching back to the floating layout
+		if t.layout == awful.layout.suit.floating then
+			
+			-- Wrap in a delayed_call. Awesome's layout engine can be aggressive 
+			-- during transitions. This ensures our manual geometry override 
+			-- happens AFTER the layout engine has completely settled.
+			local gears = require("gears")
+			gears.timer.delayed_call(function()
+				
+				for _, c in ipairs(t:clients()) do
+					-- Restore geometry for tiled windows that have a saved floating state
+					local geom = c._saved_floating_geom
+					if geom and c.valid and not c.floating then
+						c:geometry(geom)
+					end
+				end
+				
+			end)
+		end
+		queue_sweep()
 	end)
 
     client.connect_signal("tagged", function(c, t) evaluate_screen(t.screen) end)
@@ -904,7 +945,7 @@ function M.setup()
         local function execute_kill()
             local conflux_workspace = c:get_xproperty("_STELLAR_CONFLUX_WORKSPACE")
 			if conflux_workspace and conflux_workspace ~= "" then
-                conflux.kill_workspace(conflux_workspace, true)
+                conflux.kill_workspace(conflux_workspace, c, true)
             else
                 c:kill()
             end
@@ -1126,6 +1167,20 @@ function M.setup()
         popup_buttons:connect_signal("mouse::enter", function() hide_timer:stop() end)
         popup_buttons:connect_signal("mouse::leave", function() hide_timer:again() end)
 
+        -- Cross-screen dismissal (zaphodheads). When the pointer swipes off this
+        -- screen onto another monitor, no widget mouse::leave fires, so the popup
+        -- sticks open. stellar_bridge broadcasts "stellar::pointer_left_screen"
+        -- for exactly this case (the tab popup gets this for free via
+        -- stellar_ui.hover_popup; this button popup is a hand-rolled awful.popup
+        -- so it needs its own subscription). Hide immediately - the pointer is
+        -- already gone, there's nothing to re-enter. The handler is disconnected
+        -- in the unmanage handler below so it doesn't leak per client.
+        local function on_pointer_left_screen()
+            hide_timer:stop()
+            popup_buttons.visible = false
+        end
+        awesome.connect_signal("stellar::pointer_left_screen", on_pointer_left_screen)
+
         local hover_area = wibox.widget {
             stellar_ui.create_slice(c, "win", "button", false, slice_data),
             widget = wibox.container.background,
@@ -1287,6 +1342,10 @@ function M.setup()
 		c._stellar_popup_buttons = popup_buttons
 
 		c:connect_signal("unmanage", function()
+			-- Stop listening for cross-screen dismissal; this client's popup is
+			-- going away, and leaving the handler connected would leak one
+			-- subscription per client opened over the session.
+			awesome.disconnect_signal("stellar::pointer_left_screen", on_pointer_left_screen)
 			if c._stellar_popup_buttons then
 				c._stellar_popup_buttons.visible = false
 				c._stellar_popup_buttons = nil

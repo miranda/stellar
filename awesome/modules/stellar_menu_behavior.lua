@@ -14,28 +14,6 @@
 --      pointer outside every visible menu. The timer resets whenever the
 --      pointer is over any menu in the tree.
 --
---   3. Click-away dismissal: a left/middle click outside the menu closes it.
---      X11 delivers a click directly to the window under the pointer --
---      nothing else is told -- so this can't be observed from the menu; it
---      must ride along on the button events awesome already receives. This
---      module wires that up itself, once, with no rc.lua changes:
---        * every managed client gets an extra plain button-1/2 binding
---          appended (awesome replays grabbed clicks to the app, and multiple
---          bindings on one button coexist, so click-to-focus and in-app
---          clicking are completely untouched);
---        * the desktop gets the same bindings appended to root.buttons --
---          deferred one main-loop tick via gears.timer.delayed_call so it
---          lands AFTER rc.lua's own root.buttons(...) call instead of being
---          overwritten by it.
---      The handler only hides when the press is genuinely outside the tree
---      (pointer_in_tree guard), so menu-item clicks are never disturbed.
---      NOT covered automatically: clicks on wibars (there is no public
---      registry of them) -- add `mybar:connect_signal("button::press",
---      stellar_menu.hide_if_open)` where the bar is created if you want
---      that too; and modifier-clicks (Mod4+click matches the move/resize
---      bindings, not these). Autohide mops up both within a few seconds.
---
---
 -- WHY A WRAPPER, NOT A PATCH:
 -- awful.menu has no hover-delay or triangle setting to override -- submenu
 -- show/hide is hardwired into its item_enter. So we don't configure it; we
@@ -68,18 +46,15 @@
 -- enter with no timer (stuck until the pointer re-crossed a row boundary)
 -- and infinite holds -- are both structurally impossible here.
 --
--- This reaches into awful.menu internals:
--- (item_enter, exec, .child, .active_child, per-menu .wibox geometry).
+--- This reaches into awful.menu internals:
+--- (item_enter, exec, .child, .active_child, per-menu .wibox geometry).
 --   * hover enters arrive as item_enter(num, {hover=true, mouse=true})
 --   * keyboard/click enters carry no .hover -> they bypass all of this
 --   * submenus are built lazily in exec() and cached in self.child[num]
 --   * the open submenu is self.active_child, its drawin is .wibox
 
 local gears = require("gears")
-local awful = require("awful")   -- only for awful.button (lock/numlock-safe)
 local mouse = mouse           -- AwesomeWM global
-local client = client         -- AwesomeWM global (capi)
-local root = root             -- AwesomeWM global (capi)
 local mousegrabber = mousegrabber
 
 local B = {}
@@ -141,7 +116,7 @@ local AUTOHIDE_SLACK   = 6     -- px
 -- Is point (px,py) inside a wibox's rectangle, padded by `slack`?
 local function in_wibox(wb, px, py, slack)
     if not wb then return false end
-    -- A menu's drawin exposes x/y/width/height. -- VCHECK: field names.
+    -- A menu's drawin exposes x/y/width/height.
     local x, y, w, h = wb.x, wb.y, wb.width, wb.height
     if not (x and y and w and h) then return false end
     slack = slack or 0
@@ -158,11 +133,11 @@ local function visible_wiboxes(root)
     local function walk(m)
         if not m or seen[m] then return end
         seen[m] = true
-        -- A menu exposes its drawin as .wibox on 4.x. -- VCHECK.
+        -- A menu exposes its drawin as .wibox on 4.x.
         if m.wibox and m.wibox.visible then
             out[#out + 1] = m.wibox
         end
-        -- Open children live in .child (a map keyed by item index). -- VCHECK.
+        -- Open children live in .child (a map keyed by item index).
         if type(m.child) == "table" then
             for _, c in pairs(m.child) do walk(c) end
         end
@@ -199,7 +174,7 @@ local function in_triangle(px, py, ax, ay, bx, by, cx, cy)
 end
 
 -- The submenu currently open off menu `m`: awful.menu sets m.active_child
--- and shows its .wibox. -- VCHECK.
+-- and shows its .wibox.
 local function active_sub_wibox(m)
     local ac = m.active_child
     if ac and ac.wibox and ac.wibox.visible then return ac.wibox end
@@ -357,7 +332,7 @@ local function arm_triangle_tree(root)
         end
 
         -- Children are built lazily inside awful's exec() and cached in
-        -- self.child[num] -- VCHECK. Hook exec so each child is wrapped into
+        -- self.child[num]. Hook exec so each child is wrapped into
         -- this same state bundle the moment it exists, giving nested
         -- submenus identical behavior.
         if type(m.exec) == "function" then
@@ -399,83 +374,6 @@ local function arm_triangle_tree(root)
     _last_sampler = sampler
 
     wrap_menu(root)
-end
-
--- ====================
--- Click-away dismissal
--- ====================
--- We piggyback a handler on the button events awesome already sees.
--- That hides the menu only when a press lands outside the visible tree.
-
-local _clickaway_root  = nil    -- the currently armed menu (updated per apply)
-local _clickaway_wired = false  -- global wiring happens exactly once
-
-local function _press_outside()
-    local m = _clickaway_root
-    if not m then return end
-    if not (m.wibox and m.wibox.visible) then return end
-    -- Presses on the menu itself are the menu's own business (item exec,
-    -- right-click close). They normally can't even reach these handlers --
-    -- the menu wibox gets them -- but guard anyway.
-    if pointer_in_tree(m, 0) then return end
-    trace("clickaway", "press outside menu; hiding")
-    pcall(function() m:hide() end)
-end
-
-local function wire_clickaway_once()
-    if _clickaway_wired then return end
-    _clickaway_wired = true
-
-    -- awful.button (not raw capi) so Lock/NumLock modifier variants are
-    -- generated -- otherwise the binding silently stops matching with
-    -- NumLock on, which reads as "it randomly doesn't work".
-    local function extra_buttons()
-        return gears.table.join(
-            awful.button({}, 1, _press_outside),
-            awful.button({}, 2, _press_outside)
-            -- button 3 deliberately NOT bound: desktop right-click often
-            -- toggles a context/main menu; hiding first would fight it.
-        )
-    end
-
-    -- (1) Client windows. Append to each client's bindings at manage time
-    -- (and to everything already managed). Multiple bindings on the same
-    -- button coexist -- all matching handlers fire -- and awesome replays
-    -- grabbed client clicks to the application, so click-to-focus and the
-    -- app's own click handling are untouched. -- VCHECK: c:buttons() getter.
-    local function attach(c)
-        if not c or c._stellar_clickaway then return end
-        c._stellar_clickaway = true
-        local ok, cur = pcall(function() return c:buttons() end)
-        pcall(function()
-            c:buttons(gears.table.join(ok and cur or {}, extra_buttons()))
-        end)
-    end
-    if client then
-        pcall(function() client.connect_signal("manage", attach) end)
-        pcall(function()
-            for _, c in ipairs(client.get()) do attach(c) end
-        end)
-    end
-
-    -- (2) The desktop. rc.lua calls root.buttons(...) AFTER the section
-    -- that builds the menu, which would overwrite anything appended now --
-    -- so defer one main-loop tick (delayed_call runs after rc.lua finishes)
-    -- and append to whatever rc.lua installed. -- VCHECK: root.buttons()
-    -- getter.
-    if root then
-        gears.timer.delayed_call(function()
-            local ok, cur = pcall(function() return root.buttons() end)
-            pcall(function()
-                root.buttons(gears.table.join(ok and cur or {}, extra_buttons()))
-            end)
-        end)
-    end
-end
-
-local function arm_clickaway(menu)
-    _clickaway_root = menu
-    wire_clickaway_once()
 end
 
 -- ========================================================================
@@ -584,7 +482,6 @@ function B.apply(menu)
     probe(menu)
     arm_triangle_tree(menu)
     arm_autohide(menu)
-    arm_clickaway(menu)
     return menu
 end
 

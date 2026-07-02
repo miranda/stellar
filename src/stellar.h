@@ -46,6 +46,11 @@
 #define AWESOME_RESPAWN_WINDOW_SEC 30
 #define MAX_PENDING_WINDOWS 32
 #define MAX_TRACKED_WINDOWS 16
+// Upper bound on windows whose state we hand back across an Awesome restart.
+// One heap-allocated JSON line each; generous for a single screen's clients.
+// Lines beyond this are dropped with a logged warning rather than growing
+// unbounded (a restart with >128 windows on one screen is not a real case).
+#define MAX_TRACKED_RESTORE_WINDOWS 128
 // How long a window may sit in the pending list waiting for its title to settle.
 // The placeholder->real-title transition is sub-second in practice; this is a
 // generous upper bound. Entries older than this are evicted by the periodic
@@ -267,6 +272,26 @@ typedef struct {
     pid_t saver_pid;
     int saver_respawn_count;
     time_t saver_respawn_start;
+
+    // --- Awesome restart state hand-off (Shape A reconcile, transport only) ---
+    // When Awesome restarts (Lua state is wiped - "amnesia"), it serializes its
+    // full window state to JSON, one window per line, and sends it here BEFORE
+    // the restart re-execs. The DE holds those lines opaquely (it never parses
+    // them) in C memory - which survives the restart since the DE process does
+    // not - and replays them verbatim to the restarted Awesome during the
+    // ready_for_sync handshake. The restarted Lua then parses and reconciles.
+    //
+    // Invariants that keep this from ever resurrecting a stale session
+    // (the behavior we explicitly do NOT want):
+    //   - Lines are accumulated only between RESTORE_STATE_BEGIN and
+    //     RESTORE_STATE_END for a screen.
+    //   - Held for exactly one ready_for_sync, then cleared (consume-once).
+    //   - Cleared on awesome_quitting (quit erases; only restart hands off).
+    //   - A cold boot never populates this, so reconcile is simply never armed.
+    char   *restore_lines[MAX_SCREENS][MAX_TRACKED_RESTORE_WINDOWS];
+    int     restore_line_count[MAX_SCREENS];
+    bool    restore_accumulating[MAX_SCREENS];  // between BEGIN and END
+    bool    restore_ready[MAX_SCREENS];         // END seen, held for handoff
 } StellarState;
 
 /* ---------- Global State ---------- */

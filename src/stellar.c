@@ -2500,6 +2500,83 @@ static pid_t spawn_awesome_for_screen(
     return pid;
 }
 
+// Poll all enabled screens until every *connected* one has resolved a real
+// monitor name, or until a short timeout elapses. Purpose is twofold:
+//
+//  1. Cosmetic: monitors initialize at different speeds. Without this, each
+//     screen's AwesomeWM paints its wallpaper the moment its own monitor is
+//     ready, so the desktops appear staggered. Holding here until all screens
+//     have settled, then launching every AwesomeWM together, makes the whole
+//     desktop appear at once against the already-black X root.
+//
+//  2. Correctness: the per-screen geometry state files are keyed on the EDID
+//     monitor name. If AwesomeWM manages windows before the name is known it
+//     keys them under "Unknown_Monitor" and geometry restore misses. Settling
+//     the name before launch removes that race for the common case.
+//
+// This never hard-fails. A connected screen that still has no readable EDID
+// after the timeout simply proceeds as an unnamed ("Unknown_Monitor") screen;
+// the existing async MONITOR_NAME/MONITOR_CHANGED IPC pushes still update the
+// name afterwards, so the worst case degrades to the old behavior rather than
+// hanging. Disconnected outputs are legitimately absent and are not waited on.
+//
+// Assumes the disruptive hardware changes (mode/rotation/tearfree) have
+// ALREADY been applied, so the names we read are the final post-modeset ones.
+static void wait_for_monitors_to_settle(StellarState *st, int timeout_ms) {
+    const int poll_interval_ms = 50;
+    int elapsed_ms = 0;
+
+    for (;;) {
+        monitor_update_all_screens(st);
+
+        bool all_settled = true;
+        for (int i = 0; i < st->config.screen_count; i++) {
+            ScreenState *sc = &st->screens[i];
+
+            // Not connected -> legitimately absent, don't wait on it.
+            if (!sc->monitor_connected)
+                continue;
+
+            // Connected but no real name yet -> still pending. The single-query
+            // fallbacks that count as "no real name" are the empty string and
+            // the sentinel strings set in monitor_update_screen_info().
+            const char *n = sc->monitor_name;
+            bool named = n[0] != '\0'
+                      && strcmp(n, "Unknown") != 0
+                      && strcmp(n, "No Monitor") != 0;
+            if (!named) {
+                all_settled = false;
+            }
+        }
+
+        if (all_settled) {
+            log_info("monitor settle: all connected screens named after ~%d ms",
+                     elapsed_ms);
+            return;
+        }
+
+        if (elapsed_ms >= timeout_ms) {
+            // Not an error condition, just a note: proceed with whatever names
+            // we have. Name each screen still lacking one so a genuinely flaky
+            // EDID is at least visible in the log.
+            for (int i = 0; i < st->config.screen_count; i++) {
+                ScreenState *sc = &st->screens[i];
+                if (sc->monitor_connected &&
+                    (sc->monitor_name[0] == '\0' ||
+                     strcmp(sc->monitor_name, "Unknown") == 0 ||
+                     strcmp(sc->monitor_name, "No Monitor") == 0)) {
+                    log_info("monitor settle: screen %d still unnamed after %d ms; "
+                             "proceeding (async IPC will update it)", i, timeout_ms);
+                }
+            }
+            return;
+        }
+
+        usleep(poll_interval_ms * 1000);
+        elapsed_ms += poll_interval_ms;
+    }
+}
+
 static void launch_all_awesome(StellarState *st) {
     for (int i = 0; i < st->config.screen_count; i++) {
         spawn_awesome_for_screen(st, i);
@@ -3000,10 +3077,25 @@ int main(void) {
 		log_error("application menu build failed");
 	}
 
+	// Apply the disruptive hardware changes first, while the X root is still
+	// black and no AwesomeWM is running yet. These re-init the monitors (and
+	// can momentarily flash), so doing them here keeps that churn invisible.
+	// monitor_apply_all_* internally refresh each screen's info on success.
 	monitor_update_all_screens(&st);
 	monitor_apply_all_preferred_modes(&st);
 	monitor_apply_all_rotations(&st);
 	monitor_apply_all_tearfree(&st);
+
+	// Barrier: hold until every connected screen has settled (name resolved),
+	// or 2s elapses. This both (a) lets all monitors finish initializing so the
+	// desktops appear simultaneously when we launch AwesomeWM below, and (b)
+	// resolves the EDID names before any window is managed, so geometry state
+	// keys on the real monitor instead of "Unknown_Monitor". Never hard-fails;
+	// a still-unnamed connected screen just proceeds and is corrected async.
+	wait_for_monitors_to_settle(&st, 2000);
+
+	// DPI depends on settled monitor physical size / resolution, so it must run
+	// AFTER the barrier's final query, not before.
 	apply_dpi_settings(&st);
 
 	generate_stellar_xresources(&st);

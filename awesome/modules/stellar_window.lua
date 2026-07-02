@@ -724,9 +724,49 @@ function M.setup()
         end
 
 		local layout = awful.layout.get(c.screen)
-		-- If the layout is floating, but the window technically isn't, track its real position
-		if c.floating or layout == awful.layout.suit.floating then
-			c._saved_floating_geom = c:geometry()
+		-- If the layout is floating, but the window technically isn't, track its
+		-- real position. We must IGNORE artificially inflated geometry
+		-- (fullscreen, maximized) or _saved_floating_geom gets poisoned with the
+		-- screen-sized rect.
+		--
+		-- The flag checks alone are NOT sufficient: Awesome can fire
+		-- property::geometry with the inflated rect BEFORE c.fullscreen /
+		-- c.maximized become readable as true in this handler (the geometry
+		-- change and the flag propagation are not atomic). Observed directly:
+		-- entering fullscreen fired this handler with c.fullscreen==false and
+		-- the full-screen rect, poisoning the saved geometry.
+		--
+		-- So we ADD a geometry heuristic that doesn't depend on flag timing: a
+		-- fullscreen window's geometry equals the screen geometry, and a
+		-- maximized window's equals the workarea. If the reported rect matches
+		-- either, treat it as inflated regardless of what the flags currently
+		-- read. Together with the flag checks (which catch cases the heuristic
+		-- can't, e.g. a real window that happens to fill the workarea), this
+		-- closes the race.
+		if (c.floating or layout == awful.layout.suit.floating)
+			and not c.fullscreen
+			and not c.maximized
+			and not c.maximized_horizontal
+			and not c.maximized_vertical then
+
+			local g = c:geometry()
+			local s = c.screen
+			local sg = s and s.geometry
+			local wa = s and s.workarea
+
+			-- Does g exactly match the screen (fullscreen) or workarea (maximized)?
+			local function same(a, b)
+				return a and b
+					and a.x == b.x and a.y == b.y
+					and a.width == b.width and a.height == b.height
+			end
+
+			local looks_fullscreen = same(g, sg)
+			local looks_maximized  = same(g, wa)
+
+			if not looks_fullscreen and not looks_maximized then
+				c._saved_floating_geom = g
+			end
 		end
     end)
 

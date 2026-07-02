@@ -37,6 +37,7 @@ local wibox     = require("wibox")
 local gears     = require("gears")
 local beautiful = require("beautiful")
 local stellar_ui = require("modules.stellar_ui")
+local behavior  = require("modules.stellar_menu_behavior")
 
 local M = {}
 
@@ -331,7 +332,11 @@ local function rebuild()
 
     local menu = awful.menu({
         items = items,
-        theme = { width = root_width },
+        theme = {
+			width		 = root_width,
+			border_width = 2,
+        	border_color = "#3300cc"
+		},
     })
 
     -- Intercept 'show' to highlight the icon
@@ -352,6 +357,12 @@ local function rebuild()
 
     -- Store the live menu so the launcher can toggle it
     _current_menu = menu
+
+    -- Layer on corner-crossing tolerance + auto-hide. Done AFTER the show/hide
+    -- interceptors above so autohide's own show/hide wrappers sit outside them:
+    -- call chain becomes autohide -> icon-highlight -> original. Re-applied on
+    -- every rebuild because each rebuild produces a brand-new menu object.
+    behavior.apply(menu)
 
     if _on_rebuild then
         _on_rebuild(menu)

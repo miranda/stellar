@@ -649,6 +649,98 @@ void parse_settings_from_json(StellarState *st) {
 }
 
 
+/* ---------- Awesome restart state hand-off (transport only) ---------- */
+// The DE stores restore lines opaquely and replays them verbatim; it never
+// parses the JSON. See the StellarState comment for the invariants.
+
+static void restore_state_clear(StellarState *st, int screen) {
+    if (screen < 0 || screen >= MAX_SCREENS) return;
+    for (int i = 0; i < st->restore_line_count[screen]; i++) {
+        free(st->restore_lines[screen][i]);
+        st->restore_lines[screen][i] = NULL;
+    }
+    st->restore_line_count[screen] = 0;
+    st->restore_accumulating[screen] = false;
+    st->restore_ready[screen] = false;
+}
+
+// Begin a fresh accumulation for a screen. Any previously held (unconsumed)
+// blob for that screen is discarded first, so we always hold the most recent
+// restart's state, never a stale one.
+static void restore_state_begin(StellarState *st, int screen) {
+    if (screen < 0 || screen >= MAX_SCREENS) return;
+    restore_state_clear(st, screen);
+    st->restore_accumulating[screen] = true;
+    log_info("restore-state: begin accumulation for screen %d", screen);
+}
+
+// Store one opaque line (the full "RESTORE_STATE_WIN ..." line as received,
+// including the prefix, so replay is a verbatim echo).
+static void restore_state_add_line(StellarState *st, int screen, const char *line) {
+    if (screen < 0 || screen >= MAX_SCREENS) return;
+    if (!st->restore_accumulating[screen]) {
+        log_error("restore-state: WIN line for screen %d outside BEGIN/END; dropping",
+                  screen);
+        return;
+    }
+    if (st->restore_line_count[screen] >= MAX_TRACKED_RESTORE_WINDOWS) {
+        log_error("restore-state: screen %d exceeded %d lines; dropping extra",
+                  screen, MAX_TRACKED_RESTORE_WINDOWS);
+        return;
+    }
+    char *dup = strdup(line);
+    if (!dup) {
+        log_error("restore-state: strdup failed for screen %d line", screen);
+        return;
+    }
+    st->restore_lines[screen][st->restore_line_count[screen]++] = dup;
+}
+
+// Mark accumulation complete and hold for the next ready_for_sync.
+static void restore_state_end(StellarState *st, int screen) {
+    if (screen < 0 || screen >= MAX_SCREENS) return;
+    if (!st->restore_accumulating[screen]) {
+        log_error("restore-state: END for screen %d without BEGIN; ignoring", screen);
+        return;
+    }
+    st->restore_accumulating[screen] = false;
+    st->restore_ready[screen] = true;
+    log_info("restore-state: held %d line(s) for screen %d, ready for handoff",
+             st->restore_line_count[screen], screen);
+}
+
+// Replay held lines verbatim to a freshly-registered Awesome, then clear
+// (consume-once). No-op if nothing is held for this screen (cold boot / quit).
+static void restore_state_replay_to_fd(StellarState *st, int screen, int fd) {
+    if (screen < 0 || screen >= MAX_SCREENS) return;
+    if (!st->restore_ready[screen] || st->restore_line_count[screen] == 0) {
+        return;
+    }
+    log_info("restore-state: replaying %d line(s) to screen %d fd=%d",
+             st->restore_line_count[screen], screen, fd);
+
+    // BEGIN and END are control lines: they are consumed on receive (to bracket
+    // accumulation) and NOT stored, so we synthesize them here to bracket the
+    // replayed content. Without these, the restarted Awesome never sees BEGIN
+    // (reconcile never arms) or END (reconcile never triggers) -- it would only
+    // receive the bare WIN/TAGS/CONFLUX lines.
+    char ctrl[64];
+    int m = snprintf(ctrl, sizeof(ctrl), "RESTORE_STATE_BEGIN screen=%d\n", screen);
+    if (m > 0) write(fd, ctrl, (size_t)m);
+
+    for (int i = 0; i < st->restore_line_count[screen]; i++) {
+        const char *l = st->restore_lines[screen][i];
+        write(fd, l, strlen(l));
+        write(fd, "\n", 1);
+    }
+
+    m = snprintf(ctrl, sizeof(ctrl), "RESTORE_STATE_END screen=%d\n", screen);
+    if (m > 0) write(fd, ctrl, (size_t)m);
+
+    restore_state_clear(st, screen);  // consumed
+}
+
+
 static void register_awesome_client(
     StellarState *st,
     IpcClient *c,
@@ -721,11 +813,27 @@ static void handle_ipc_line(
         );
 
         if (n >= 2 && strcmp(role, "awesome") == 0) {
-            // Register the new socket. (This also sends POINTER_SCREEN)
+            bool wants_sync = (strstr(line, "status=ready_for_sync") != NULL);
+
+            // On a restart sync, replay the held window-state blob FIRST --
+            // before register_awesome_client pushes MONITOR_NAME. Ordering
+            // matters: Awesome processes socket lines in order, and receiving
+            // MONITOR_NAME triggers its park-drain (placing parked windows). If
+            // that drain runs before RESTORE_STATE_BEGIN has armed reconcile on
+            // the Lua side, the parked windows get file-placed (geometry snaps
+            // back) before reconcile can claim them. Sending BEGIN...END ahead
+            // of MONITOR_NAME guarantees reconcile is armed before the drain.
+            // Cold boot holds nothing, so this is a no-op there.
+            if (wants_sync) {
+                restore_state_replay_to_fd(st, screen_num, c->fd);
+            }
+
+            // Register the new socket. (This also sends POINTER_SCREEN and
+            // MONITOR_NAME.)
             register_awesome_client(st, c, screen_num, (pid_t)pid);
 
             // Check if AwesomeWM woke up with amnesia and needs a sync
-            if (strstr(line, "status=ready_for_sync") != NULL) {
+            if (wants_sync) {
                 log_info("AwesomeWM (screen=%d) requested a state sync. Pushing state...", screen_num);
 
 				//allow picom live-update
@@ -966,6 +1074,36 @@ static void handle_ipc_line(
 		return;
 	}
 
+    // --- Awesome restart state hand-off (transport only) ---
+    // Awesome sends these just before a restart re-execs. We store the WIN/TAGS
+    // lines verbatim and replay them on the next ready_for_sync. The DE never
+    // parses the JSON payload - it's opaque transport.
+    if (strncmp(line, "RESTORE_STATE_BEGIN", 19) == 0) {
+        int screen_idx = -1;
+        if (sscanf(line, "RESTORE_STATE_BEGIN screen=%d", &screen_idx) == 1) {
+            restore_state_begin(st, screen_idx);
+        }
+        return;
+    }
+    if (strncmp(line, "RESTORE_STATE_WIN", 17) == 0 ||
+        strncmp(line, "RESTORE_STATE_TAGS", 18) == 0 ||
+        strncmp(line, "RESTORE_CONFLUX", 15) == 0) {
+        int screen_idx = -1;
+        // All carry "screen=N" right after the keyword.
+        const char *sp = strstr(line, "screen=");
+        if (sp && sscanf(sp, "screen=%d", &screen_idx) == 1) {
+            restore_state_add_line(st, screen_idx, line);  // store verbatim
+        }
+        return;
+    }
+    if (strncmp(line, "RESTORE_STATE_END", 17) == 0) {
+        int screen_idx = -1;
+        if (sscanf(line, "RESTORE_STATE_END screen=%d", &screen_idx) == 1) {
+            restore_state_end(st, screen_idx);
+        }
+        return;
+    }
+
     if (strncmp(line, "EVENT type=awesome_startup", 26) == 0) {
         int screen_idx = -1;
         if (sscanf(line, "EVENT type=awesome_startup screen=%d", &screen_idx) == 1) {
@@ -983,6 +1121,16 @@ static void handle_ipc_line(
 
     if (strncmp(line, "EVENT type=awesome_quitting", 27) == 0) {
         log_info("Received QUIT signal from AwesomeWM.");
+        // Quit, not restart: discard any held restore blob for this screen so
+        // it can never be replayed into a later start. (screen= is present on
+        // the event; if parseable, clear just that screen, else clear all.)
+        int screen_idx = -1;
+        if (sscanf(line, "EVENT type=awesome_quitting screen=%d", &screen_idx) == 1
+            && screen_idx >= 0 && screen_idx < MAX_SCREENS) {
+            restore_state_clear(st, screen_idx);
+        } else {
+            for (int s = 0; s < MAX_SCREENS; s++) restore_state_clear(st, s);
+        }
 		st->stellar_shutdown = true;
     }
 

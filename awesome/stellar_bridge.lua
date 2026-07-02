@@ -659,9 +659,14 @@ stellar_api.take_screenshot = function(mode)
         scrot_cmd = "scrot " .. screenshot_filename .. " -e 'xclip -selection clipboard -target image/png -i \"$f\" >/dev/null 2>&1'"
     end
 
-    awful.spawn.easy_async_with_shell(scrot_cmd, function()
-        flash_screen()
-        play_system_sound(soundfile)
+    awful.spawn.easy_async_with_shell(scrot_cmd, function(stdout, stderr, exitreason, exitcode)
+        -- Only flash and play sound if scrot exited successfully
+        if exitcode == 0 then
+            flash_screen()
+            play_system_sound(soundfile)
+        else
+            stellar_log("screenshot canceled or failed (exit code: " .. tostring(exitcode) .. ")")
+        end
     end)
 end
 
@@ -703,6 +708,22 @@ local function sanitize_name(str)
 end
 
 local function get_geometry_state_file(c, monitor_edid_name)
+    -- Fail closed on an unresolved monitor name. Previously an unknown name
+    -- silently produced a valid-looking path under "Unknown_Monitor", so a
+    -- window managed before the name was known would save/restore geometry to
+    -- the wrong directory forever. Returning nil makes load_client_geometry
+    -- fall through to default placement (acceptable, self-heals on the next
+    -- settled manage) and makes save_client_geometry a no-op (no bogus dir).
+    if not monitor_edid_name
+       or monitor_edid_name == ""
+       or monitor_edid_name == "Unknown_Monitor"
+       or monitor_edid_name == "Unknown"
+       or monitor_edid_name == "No Monitor" then
+        stellar_log("geometry: monitor name unresolved ('"
+            .. tostring(monitor_edid_name) .. "'), skipping state file")
+        return nil
+    end
+
     local state_home = os.getenv("XDG_STATE_HOME")
     if not state_home or state_home == "" then
         local home = os.getenv("HOME") or "/tmp"
@@ -762,6 +783,13 @@ local function install_stellar_hooks(socket_unix)
 	stellar_api._grab = nil
 	stellar_api._active_client = nil
 	stellar_api._pointer_on_screen = false
+	-- Reconcile state initialized early (before connect()/socket reads) so a
+	-- replayed RESTORE_STATE_* line can never be processed before these exist.
+	-- The apply functions are defined further down but are only invoked from
+	-- timer callbacks that fire after all synchronous init completes.
+	stellar_api._reconcile_active = false
+	stellar_api._reconcile_windows = nil
+	stellar_api._reconcile_tags = nil
 
 	local stellar = {
         sock = nil,
@@ -1057,6 +1085,114 @@ local function install_stellar_hooks(socket_unix)
         if mon_name then
             stellar_api.monitor_name = mon_name
             stellar_api.log("Cached monitor name: " .. mon_name)
+            -- Name just resolved: place any windows parked during the reload
+            -- race window (see park-and-drain near the manage handler).
+            if stellar_api._drain_pending_placement then
+                stellar_api._drain_pending_placement(false)
+            end
+            return
+        end
+
+        -- ===== Restart state hand-off receiver =====
+        -- The DE replays the RESTORE_STATE_* lines we sent before restarting.
+        -- Receiving them means this startup is a restart with held state (never
+        -- a cold boot), so we arm reconcile mode: the manage handler suppresses
+        -- file-based geometry restore, and after the manage storm settles we
+        -- apply the captured state (3b-1: z-stack; 3b-2: geometry/flags/tags).
+        if line:match("^RESTORE_STATE_BEGIN") then
+            stellar_api._restore_incoming = { windows = {}, tags = nil }
+            stellar_api._reconcile_active = true
+            stellar_api._reconcile_windows = nil
+            stellar_api._reconcile_tags = nil
+            stellar_api.log("restore: BEGIN receiving state blob (reconcile armed)")
+            -- Cover: hide everything already managed so the reconcile happens
+            -- out of sight. Windows remanage BEFORE this line arrives over the
+            -- socket, so this mass-hide (not the manage-time hide) is what
+            -- covers the bulk of them. Revealed in final state at settle.
+            if stellar_api._reconcile_cover then
+                stellar_api._reconcile_cover()
+            end
+            return
+        end
+        local win_json = line:match("^RESTORE_STATE_WIN%s+screen=%d+%s+(.+)$")
+        if win_json then
+            local ok, obj = pcall(json.decode, win_json, 1, nil)
+            if ok and obj then
+                if stellar_api._restore_incoming then
+                    table.insert(stellar_api._restore_incoming.windows, obj)
+                end
+                stellar_api.log(string.format(
+                    "restore WIN: wid=%s class=%s floating=%s stack=%s "
+                    .. "min=%s max=%s fs=%s ontop=%s sticky=%s hidden=%s fsd=%s geo=%s tags=%s",
+                    tostring(obj.wid), tostring(obj.class), tostring(obj.floating),
+                    tostring(obj.stack), tostring(obj.minimized), tostring(obj.maximized),
+                    tostring(obj.fullscreen), tostring(obj.ontop), tostring(obj.sticky),
+                    tostring(obj.hidden), tostring(obj.fullscreen_desktop),
+                    obj.geometry and string.format("%d,%d,%d,%d", obj.geometry.x,
+                        obj.geometry.y, obj.geometry.width, obj.geometry.height) or "nil",
+                    obj.tags and (#obj.tags .. " tag(s)") or "nil"))
+            else
+                stellar_api.log("restore WIN: json.decode failed: " .. tostring(win_json))
+            end
+            return
+        end
+        local tags_json = line:match("^RESTORE_STATE_TAGS%s+screen=%d+%s+(.+)$")
+        if tags_json then
+            local ok, obj = pcall(json.decode, tags_json, 1, nil)
+            if ok and obj then
+                if stellar_api._restore_incoming then
+                    stellar_api._restore_incoming.tags = obj
+                end
+                stellar_api.log("restore TAGS: selected=" .. tostring(obj.selected)
+                    .. " layouts=" .. tostring(obj.layouts and #obj.layouts or 0))
+            end
+            return
+        end
+        -- Conflux workspace tab order + active tab. Seed it IMMEDIATELY (not
+        -- deferred to reconcile) so conflux.tab_orders is populated before the
+        -- orphaned tabs hit the manage handler's orphan-adoption path -- that is
+        -- what preserves manual order and restores the active tab instead of
+        -- falling back to alphabetical + first-orphan-visible.
+        local conflux_json = line:match("^RESTORE_CONFLUX%s+screen=%d+%s+(.+)$")
+        if conflux_json then
+            local ok, obj = pcall(json.decode, conflux_json, 1, nil)
+            if ok and obj then
+                if stellar_api._restore_incoming then
+                    stellar_api._restore_incoming.conflux = obj
+                end
+                local ok_cx, conflux = pcall(require, "modules.conflux")
+                if ok_cx and conflux and conflux.seed_restart_restore then
+                    conflux.seed_restart_restore(obj)
+                    stellar_api.log("restore CONFLUX: seeded "
+                        .. tostring(#obj) .. " workspace(s)")
+                else
+                    stellar_api.log("restore CONFLUX: module/seed unavailable")
+                end
+            else
+                stellar_api.log("restore CONFLUX: json.decode failed")
+            end
+            return
+        end
+        if line:match("^RESTORE_STATE_END") then
+            local incoming = stellar_api._restore_incoming
+            local n = incoming and #incoming.windows or 0
+            stellar_api.log("restore: END received " .. tostring(n)
+                .. " window record(s) -- triggering reconcile (z-stack)")
+
+            -- Hand the window records to reconcile and start the settle-then-
+            -- apply. If for some reason nothing was collected, disarm so we
+            -- don't leave placement suppressed.
+            if incoming and n > 0 then
+                stellar_api._reconcile_windows = incoming.windows
+                stellar_api._reconcile_tags = incoming.tags
+                if stellar_api._run_reconcile then
+                    stellar_api._run_reconcile()
+                end
+            else
+                stellar_api._reconcile_active = false
+                stellar_api._reconcile_windows = nil
+                stellar_api._reconcile_tags = nil
+            end
             return
         end
 
@@ -1066,6 +1202,10 @@ local function install_stellar_hooks(socket_unix)
             if tonumber(changed_screen) == stellar.screen_num then
                 stellar_api.monitor_name = new_name
                 stellar_api.log("Updated monitor name after hotplug: " .. new_name)
+                -- In case any window was parked awaiting a name, place it now.
+                if stellar_api._drain_pending_placement then
+                    stellar_api._drain_pending_placement(false)
+                end
             end
             return
         end
@@ -1230,7 +1370,7 @@ local function install_stellar_hooks(socket_unix)
 	stellar_api.load_client_geometry = function(c)
 		if not c or not c.valid or is_fullscreen_desktop(c) then return false end
 
-		local edid_name = stellar_api.monitor_name or "Unknown_Monitor"
+		local edid_name = stellar_api.monitor_name  -- nil when unresolved; get_geometry_state_file fails closed
 		local state_path = get_geometry_state_file(c, edid_name)
 
 		if state_path and (c.floating or awful.layout.get(c.screen).name == "floating") then
@@ -1252,90 +1392,674 @@ local function install_stellar_hooks(socket_unix)
 		return false
 	end
 
+	-- ============================================================
+	-- Park-and-drain placement (reload race fix)
+	-- ------------------------------------------------------------
+	-- Geometry restore keys on the monitor name. On cold boot the DE's settle
+	-- barrier guarantees the name is known before AwesomeWM spawns, so at
+	-- 'manage' time the name is already present and placement runs immediately.
+	--
+	-- On a Lua-side awesome.restart() (menu "restart awesome") the DE barrier
+	-- does NOT run -- AwesomeWM relearns its name asynchronously via the
+	-- MONITOR_NAME socket push during startup. Window 'manage' races that push:
+	-- a window managed before the name arrives would key on nil, fail restore,
+	-- and land in the default corner placement. That race is per-window and
+	-- nondeterministic (the "reload N times, sometimes windows scatter" bug).
+	--
+	-- Fix: if the name isn't resolved when a window is managed, PARK it instead
+	-- of placing it. When the name arrives (MONITOR_NAME / MONITOR_CHANGED
+	-- handlers) we DRAIN the parked list and place each one then. A bounded
+	-- safety timer drains anyway after a timeout so nothing is stuck if the
+	-- name never comes (worst case: corner fallback, i.e. old behavior, but
+	-- deterministically). The event loop keeps running throughout, so the very
+	-- socket message we're waiting on is free to arrive -- no blocking.
+	local pending_placement = {}
+
+	local function monitor_name_resolved()
+		local n = stellar_api.monitor_name
+		return n ~= nil and n ~= ""
+			and n ~= "Unknown_Monitor" and n ~= "Unknown" and n ~= "No Monitor"
+	end
+
+	-- The actual placement decision, factored out of the manage handler so it
+	-- can run either immediately (name known) or deferred (on drain).
+	local function apply_placement(c)
+		if not c or not c.valid then return end
+		if c._stellar_placement_handled then return end
+
+		local loaded_saved = false
+
+		-- Try to load saved geometry (only applies for floating windows;
+		-- load_client_geometry enforces that and the fail-closed name check).
+		local saved_geo = stellar_api.load_client_geometry(c)
+		if saved_geo then
+			loaded_saved = true
+
+			-- Check if this is a Conflux window
+			local is_conflux = c.instance and c.instance:match("^stellar_conflux_")
+
+			-- Enforce-once guard. Some clients (e.g. Lutris) re-assert their
+			-- own remembered position shortly after mapping, via a path that
+			-- does NOT come through request::geometry -- so the move only shows
+			-- up as property::geometry, which fires AFTER the position already
+			-- changed. We watch for the first such deviation, snap it back to
+			-- saved_geo once, then disarm and let the window move freely.
+			--
+			-- Only clients that actually restored a saved geometry arm this.
+			-- Brand-new windows never do, so their default placement is
+			-- untouched.
+			if not is_conflux then
+				c._stellar_geom_guard = saved_geo
+
+				local function enforce_once(cl)
+					if not cl._stellar_geom_guard then return end
+					local g = cl._stellar_geom_guard
+					-- Disarm first so our own :geometry() call below
+					-- (which re-fires property::geometry) doesn't recurse.
+					cl._stellar_geom_guard = nil
+					cl:disconnect_signal("property::geometry", enforce_once)
+
+					local cur = cl:geometry()
+					if cur.x ~= g.x or cur.y ~= g.y
+						or cur.width ~= g.width or cur.height ~= g.height then
+						cl:geometry(g)
+						stellar_log("geom guard: overrode self-reposition of "
+							.. tostring(cl.class) .. " back to saved "
+							.. string.format("%d,%d,%d,%d", g.x, g.y, g.width, g.height))
+					end
+				end
+
+				c:connect_signal("property::geometry", enforce_once)
+
+				-- Safety net: if the client never repositions itself, drop the
+				-- guard so a much later legitimate move isn't caught. Disarming
+				-- is idempotent with enforce_once.
+				gears.timer.start_new(4.0, function()
+					if c.valid and c._stellar_geom_guard then
+						c._stellar_geom_guard = nil
+						c:disconnect_signal("property::geometry", enforce_once)
+					end
+					return false
+				end)
+			end
+		end
+
+		-- Fallback to settings.json defaults for brand new windows
+		if not loaded_saved and not c.fullscreen and not c.maximized then
+			local placement_rules = stellar_api.stellar_settings.default_placement
+			local placement_engine = require("awful.placement")
+
+			for _, rule_name in ipairs(placement_rules) do
+				if placement_engine[rule_name] then
+					placement_engine[rule_name](c, { honor_workarea = true })
+				end
+			end
+		end
+	end
+
+	-- Place any windows that were parked waiting for the monitor name.
+	-- force=true means the safety timer expired: place them regardless (they
+	-- take corner fallback if the name is still unresolved).
+	stellar_api._drain_pending_placement = function(force)
+		if #pending_placement == 0 then return end
+		if not force and not monitor_name_resolved() then return end
+
+		-- If a restart reconcile is active, the snapshot is the authority on
+		-- these windows' placement -- do NOT apply file placement to them, or
+		-- they snap back to stale file geometry. Reconcile handles them (z-stack
+		-- now; full geometry/flags in 3b-2). Just clear the queue.
+		--
+		-- This closes the path that made snap-back 100%: on a restart the name
+		-- is unresolved when windows manage, so they PARK rather than hit the
+		-- manage-handler reconcile gate; the name then arrives and drains them
+		-- through apply_placement, bypassing that gate. Gating here too covers
+		-- the park-drain path.
+		if stellar_api._reconcile_active then
+			stellar_log("draining " .. tostring(#pending_placement)
+				.. " parked window(s): reconcile active, discarding file "
+				.. "placement (snapshot owns geometry)")
+			pending_placement = {}
+			return
+		end
+
+		local drained = pending_placement
+		pending_placement = {}
+		stellar_log("draining " .. tostring(#drained)
+			.. " parked window(s) for placement (force=" .. tostring(force)
+			.. ", name=" .. tostring(stellar_api.monitor_name) .. ")")
+		for _, c in ipairs(drained) do
+			apply_placement(c)
+		end
+	end
+
+	-- Safety net: if the name never resolves after a reload, drain anyway so
+	-- parked windows aren't stuck unplaced. 2s mirrors the DE-side barrier.
+	gears.timer.start_new(2.0, function()
+		if #pending_placement > 0 then
+			stellar_log("placement drain timeout: name still unresolved, "
+				.. "placing parked windows with fallback")
+			stellar_api._drain_pending_placement(true)
+		end
+		return false  -- one-shot
+	end)
+
+	-- ============================================================
+	-- Reconcile mode (restart restore, 3b-1: gate + z-stack)
+	-- ------------------------------------------------------------
+	-- Armed when RESTORE_STATE records arrive on the sync handshake (i.e. this
+	-- startup is a restart with held state, not a cold boot). While armed:
+	--   * the manage handler SUPPRESSES its file-based geometry restore, because
+	--     the snapshot is the authority on the reload path (this is what stops
+	--     windows snapping back to stale file geometry).
+	--   * after the manage storm settles, we apply the captured z-stack order.
+	-- ============================================================
+	-- Reconcile visibility cover ("hide, reconcile in the dark, reveal")
+	-- ------------------------------------------------------------
+	-- Without this, restarted windows are visible wherever Awesome's remanage
+	-- drops them and then visibly shuffle when reconcile applies states/z-stack.
+	-- With it: everything is hidden the moment we know this is a restart
+	-- (RESTORE_STATE_BEGIN), reconciled while unmapped, and revealed in final
+	-- state -- KDE-plasmashell-style "disappear, reappear settled".
+	--
+	-- Two cover hooks are needed because windows remanage BEFORE the BEGIN line
+	-- arrives over the socket (manage is local startup; the socket poll comes
+	-- later): a mass-hide at BEGIN for everything already managed, plus a
+	-- hide-at-manage for late arrivals while reconcile is armed.
+	--
+	-- The reveal restores each record's INTENDED hidden state (captured in the
+	-- snapshot) rather than blanket-unhiding, so fullscreen_desktop and hidden
+	-- Conflux siblings come back correctly. Unmatched covered windows (e.g. a
+	-- brand-new window that appeared mid-reload) are simply unhidden.
+	--
+	-- stalonetray is Stellar-owned and never touched.
+	local function is_tray(c)
+		return c.class == "stalonetray"
+			or c.instance == "stalonetray"
+			or c.name == "stalonetray"
+	end
+
+	stellar_api._reconcile_cover = function()
+		local s = screen[stellar.screen_num] or awful.screen.focused()
+		if not s then return end
+		local covered = 0
+		for _, c in ipairs(s.all_clients) do
+			if c.valid and not is_tray(c) and not c.hidden then
+				c.hidden = true
+				covered = covered + 1
+			end
+		end
+		stellar_log("reconcile: cover -- hid " .. covered .. " window(s)")
+
+		-- Failsafe: if reconcile never completes (e.g. RESTORE_STATE_END never
+		-- arrives, so the settle never starts), the cover would leave the
+		-- desktop hidden forever. If reconcile is still armed well past the
+		-- settle bound (4s), force-reveal everything and disarm. In a healthy
+		-- run reconcile has disarmed long before this fires, making it a no-op.
+		gears.timer.start_new(6.0, function()
+			if stellar_api._reconcile_active then
+				stellar_log("reconcile: FAILSAFE -- still armed 6s after cover; "
+					.. "force-revealing all windows and disarming")
+				local s2 = screen[stellar.screen_num] or awful.screen.focused()
+				if s2 then
+					for _, cl in ipairs(s2.all_clients) do
+						if cl.valid and not is_tray(cl) then cl.hidden = false end
+					end
+				end
+				stellar_api._reconcile_active = false
+				stellar_api._reconcile_windows = nil
+				stellar_api._reconcile_tags = nil
+			end
+			return false  -- one-shot
+		end)
+	end
+
+	-- Restore intended visibility from the records; unhide anything covered
+	-- that has no record. Applies rec.hidden uniformly (including Conflux and
+	-- fullscreen_desktop records: for Conflux this agrees with -- and backstops
+	-- -- force_active_tab, whose passes all run before the settle).
+	local function reconcile_reveal(records)
+		local s = screen[stellar.screen_num] or awful.screen.focused()
+		if not s then return end
+
+		local intended = {}          -- client -> intended hidden (bool)
+		if records then
+			local by_wid, by_inst = {}, {}
+			for _, c in ipairs(s.all_clients) do
+				if c.valid then
+					by_wid[c.window] = c
+					if c.instance then by_inst[c.instance] = c end
+				end
+			end
+			for _, rec in ipairs(records) do
+				local c = (rec.wid and by_wid[rec.wid])
+					or (rec.instance and by_inst[rec.instance])
+				if c and c.valid then
+					intended[c] = rec.hidden and true or false
+				end
+			end
+		end
+
+		local shown, kept_hidden = 0, 0
+		for _, c in ipairs(s.all_clients) do
+			if c.valid and not is_tray(c) then
+				-- Claim this window from the startup-cover failsafe: reveal is
+				-- now the authority on its visibility.
+				c._stellar_startup_covered = nil
+				local want_hidden = intended[c]
+				if want_hidden == nil then want_hidden = false end
+				if c.hidden ~= want_hidden then
+					c.hidden = want_hidden
+				end
+				if want_hidden then kept_hidden = kept_hidden + 1
+				else shown = shown + 1 end
+			end
+		end
+		stellar_log("reconcile: reveal -- " .. shown .. " shown, "
+			.. kept_hidden .. " intentionally hidden")
+	end
+
+	-- Geometry/flags/tags apply (3b-2). Runs at reconcile settle, before the
+	-- z-stack raise. Matches records to live clients by wid (normal) or instance
+	-- (Conflux). For each: restore tag membership, floating, geometry, then the
+	-- inflating flags (maximize/fullscreen) LAST so Awesome derives the inflated
+	-- display from the real geometry underneath, then ontop/sticky/minimized.
+	local function apply_window_states(records)
+		if not records then return end
+		local s = screen[stellar.screen_num] or awful.screen.focused()
+		if not s then return end
+
+		stellar_log("reconcile: applying window states ("
+			.. tostring(#records) .. " record(s))...")
+
+		-- wid -> client and instance -> client maps.
+		local by_wid, by_inst = {}, {}
+		for _, c in ipairs(s.all_clients) do
+			if c.valid then
+				by_wid[c.window] = c
+				if c.instance then by_inst[c.instance] = c end
+			end
+		end
+
+		local applied, failed = 0, 0
+		for _, rec in ipairs(records) do
+			-- fullscreen_desktop windows manage their own geometry/visibility
+			-- (fit_to_screen / hidden), so skip them here.
+			--
+			-- Conflux tab windows are owned by the Conflux restart restore (tab
+			-- order + active tab via seed_restart_restore/activate_tab, which
+			-- handles their geometry and hidden state). Applying generic window
+			-- states to them would fight that, so skip them too -- identified by
+			-- the stellar_conflux_ instance prefix.
+			local is_conflux = rec.instance
+				and tostring(rec.instance):match("^stellar_conflux_")
+			if not rec.fullscreen_desktop and not is_conflux then
+				local c = (rec.wid and by_wid[rec.wid])
+					or (rec.instance and by_inst[rec.instance])
+				if c and c.valid then
+					-- Per-record protection: one malformed record or one client
+					-- that objects to a property write must not abort the whole
+					-- reconcile (this runs inside a timer callback -- an
+					-- unhandled error here would silently kill the z-stack and
+					-- focus restore that follow).
+					local ok, err = pcall(function()
+						-- 1. Tag membership (by saved tag indices).
+						if rec.tags and #rec.tags > 0 then
+							local tags = {}
+							for _, te in ipairs(rec.tags) do
+								local t = s.tags[te.tag]
+								if t then table.insert(tags, t) end
+							end
+							if #tags > 0 then c:tags(tags) end
+						end
+
+						-- 2. Floating state (before geometry).
+						c.floating = rec.floating and true or false
+
+						-- 3+4. Geometry and inflating flags, together, because the
+						-- order is what makes un-fullscreen/un-maximize work.
+						--
+						-- On restart, an inflated window is managed at its
+						-- inflated size (the fullscreen/maximize atoms persist as
+						-- xproperties), so AWESOME memorizes the inflated rect as
+						-- its internal "restore to" geometry. Merely setting our
+						-- _saved_floating_geom doesn't help -- Awesome's
+						-- un-fullscreen path uses its own memorized rect, which
+						-- is why exiting fullscreen after a reload left a giant
+						-- window.
+						--
+						-- Fix: the toggle pattern (already used by the rules code
+						-- for fullscreen). CLEAR the inflating flags, apply the
+						-- real geometry while un-inflated, then set the flags
+						-- back. At the moment a flag goes true, Awesome records
+						-- the current -- now real -- geometry as the restore
+						-- target, so leaving the state later returns correctly.
+						local was_inflated = rec.fullscreen or rec.maximized
+							or rec.maximized_horizontal or rec.maximized_vertical
+
+						if was_inflated then
+							c.fullscreen = false
+							c.maximized = false
+							c.maximized_horizontal = false
+							c.maximized_vertical = false
+						end
+
+						if rec.geometry then
+							c._saved_floating_geom = {
+								x = rec.geometry.x, y = rec.geometry.y,
+								width = rec.geometry.width, height = rec.geometry.height,
+							}
+							c:geometry(rec.geometry)
+						end
+
+						if was_inflated then
+							-- Re-inflate from the real geometry just applied.
+							if rec.maximized_horizontal then c.maximized_horizontal = true end
+							if rec.maximized_vertical   then c.maximized_vertical   = true end
+							if rec.maximized  then c.maximized  = true end
+							if rec.fullscreen then c.fullscreen = true end
+						end
+
+						-- 5. Remaining flags.
+						c.ontop  = rec.ontop and true or false
+						c.sticky = rec.sticky and true or false
+						c.minimized = rec.minimized and true or false
+					end)
+					if ok then
+						applied = applied + 1
+					else
+						failed = failed + 1
+						stellar_log("reconcile: window-state apply FAILED for "
+							.. tostring(rec.class) .. " (" .. tostring(rec.wid)
+							.. "): " .. tostring(err))
+					end
+				end
+			end
+		end
+		stellar_log("reconcile: applied window states -- "
+			.. applied .. " ok, " .. failed .. " failed, "
+			.. tostring(#records) .. " record(s) total")
+	end
+
+	-- Raise clients into the recorded stack order. Mirrors the proven
+	-- _restore_z_stack convention exactly: screen.clients[1] is the TOP, so we
+	-- raise from the highest saved stack index down to 1, and each raise() puts
+	-- that client above all previously-raised ones.
+	local function apply_z_stack(records)
+		if not records then return end
+
+		-- Build a WID -> live client map for this screen.
+		local by_wid = {}
+		local s = screen[stellar.screen_num] or awful.screen.focused()
+		if not s then return end
+		for _, c in ipairs(s.all_clients) do
+			if c.valid then by_wid[c.window] = c end
+		end
+
+		-- Order records by saved stack index ascending (1 = top), then raise
+		-- from the bottom (highest index) up to the top (index 1).
+		--
+		-- Skip windows that were hidden or are fullscreen_desktop: hidden
+		-- clients aren't part of the visible stack (raising them is inert and
+		-- would only race Conflux's own active-tab raise), and fullscreen_desktop
+		-- windows manage their own layering.
+		local ordered = {}
+		for _, rec in ipairs(records) do
+			if rec.wid and rec.stack
+			   and not rec.hidden and not rec.fullscreen_desktop then
+				table.insert(ordered, rec)
+			end
+		end
+		table.sort(ordered, function(a, b) return a.stack < b.stack end)
+
+		local raised = 0
+		for i = #ordered, 1, -1 do
+			local rec = ordered[i]
+			local c = by_wid[rec.wid]
+			if c and c.valid then
+				c:raise()
+				raised = raised + 1
+			end
+		end
+		stellar_log("reconcile: applied z-stack, raised " .. raised
+			.. "/" .. #ordered .. " matched window(s)")
+	end
+
+	-- Resolve a saved {wid, instance} identity to a live client. Prefer wid
+	-- (stable for normal windows); fall back to instance (Conflux tabs, whose
+	-- wid churns across restart).
+	local function resolve_ident(ident)
+		if not ident then return nil end
+		local s = screen[stellar.screen_num] or awful.screen.focused()
+		if not s then return nil end
+		if ident.wid then
+			for _, c in ipairs(s.all_clients) do
+				if c.valid and c.window == ident.wid then return c end
+			end
+		end
+		if ident.instance then
+			for _, c in ipairs(s.all_clients) do
+				if c.valid and c.instance == ident.instance then return c end
+			end
+		end
+		return nil
+	end
+
+	-- Restore Awesome focus and Stellar active-client from the tags record.
+	-- These are INDEPENDENT (FFM/sloppy focus), so restore each separately:
+	-- active-client via set_active_client (keeps the stellar_active property /
+	-- signals consistent), focus via client.focus directly. Skip hidden/invalid
+	-- targets (focusing a hidden window is meaningless).
+	local function apply_focus_active(tags)
+		if not tags then return end
+
+		if tags.active then
+			local ac = resolve_ident(tags.active)
+			if ac and ac.valid and not ac.hidden then
+				stellar_api.set_active_client(ac)
+				stellar_log("reconcile: restored active client -> "
+					.. tostring(ac.class) .. " / " .. tostring(ac.instance))
+			end
+		end
+
+		if tags.focused then
+			local fc = resolve_ident(tags.focused)
+			if fc and fc.valid and not fc.hidden then
+				client.focus = fc
+				stellar_log("reconcile: restored focus -> "
+					.. tostring(fc.class) .. " / " .. tostring(fc.instance))
+			end
+		end
+	end
+
+	-- Restore each window's recorded urgency. Runs LAST (after focus restore,
+	-- which itself clears urgency on the focused client): activation requests
+	-- that land while a window is covered make Awesome's ewmh handler set
+	-- urgent=true (_NET_WM_STATE_DEMANDS_ATTENTION) instead of focusing, and
+	-- that spurious flag survives the reveal. Overwriting with the recorded
+	-- pre-restart value clears the spurious cases and preserves genuine ones.
+	local function apply_urgency(records)
+		if not records then return end
+		local set, cleared = 0, 0
+		for _, rec in ipairs(records) do
+			local c = resolve_ident(rec)   -- rec carries wid + instance directly
+			if c and c.valid then
+				local want = rec.urgent and true or false
+				if c.urgent ~= want then
+					c.urgent = want
+					if want then set = set + 1 else cleared = cleared + 1 end
+				end
+			end
+		end
+		if set > 0 or cleared > 0 then
+			stellar_log("reconcile: urgency restored (" .. set
+				.. " set, " .. cleared .. " cleared)")
+		end
+	end
+
+	-- Called after the restore blob is fully received (RESTORE_STATE_END) to
+	-- run the settle-then-apply. We wait for the manage storm to quiesce rather
+	-- than a fixed sleep: poll the client count until it is stable across two
+	-- checks, then apply. Bounded so it always completes.
+	stellar_api._run_reconcile = function()
+		if not stellar_api._reconcile_windows then return end
+
+		local last_count = -1
+		local stable_ticks = 0
+		local elapsed = 0
+		local interval = 0.15
+		local max_wait = 4.0
+
+		local function tick()
+			local s = screen[stellar.screen_num] or awful.screen.focused()
+			local count = s and #s.all_clients or 0
+
+			if count == last_count and count > 0 then
+				stable_ticks = stable_ticks + 1
+			else
+				stable_ticks = 0
+			end
+			last_count = count
+			elapsed = elapsed + interval
+
+			-- Apply once the count has held steady for two consecutive ticks,
+			-- or the bound is hit.
+			if stable_ticks >= 2 or elapsed >= max_wait then
+				stellar_log("reconcile: manage storm settled (count=" .. count
+					.. ", elapsed=" .. string.format("%.2f", elapsed) .. "s); applying")
+				-- Order matters and is all synchronous (one visual update):
+				--   1. window states (geometry/floating/flags/tags) applied
+				--      while everything is still covered/hidden;
+				--   2. reveal to intended visibility -- BEFORE the z-stack,
+				--      because raising unmapped (hidden) windows may not
+				--      survive the remap;
+				--   3. z-stack raise on the now-mapped windows;
+				--   4. focus/active (deferred one tick past the raises).
+				-- The states pass is pcall-protected as a whole: if it throws,
+				-- the reveal below must STILL run -- a covered desktop that
+				-- never reveals is a black screen, which is worse than any
+				-- mis-applied state.
+				local ok_states, err_states =
+					pcall(apply_window_states, stellar_api._reconcile_windows)
+				if not ok_states then
+					stellar_log("reconcile: window-states pass FAILED: "
+						.. tostring(err_states))
+				end
+				local ok_rev, err_rev =
+					pcall(reconcile_reveal, stellar_api._reconcile_windows)
+				if not ok_rev then
+					stellar_log("reconcile: reveal FAILED (" .. tostring(err_rev)
+						.. "); emergency unhide of all windows")
+					local s2 = screen[stellar.screen_num] or awful.screen.focused()
+					if s2 then
+						for _, cl in ipairs(s2.all_clients) do
+							if cl.valid and not is_tray(cl) then cl.hidden = false end
+						end
+					end
+				end
+				apply_z_stack(stellar_api._reconcile_windows)
+
+				-- Restore focus + active client AFTER z-stack, so the targets
+				-- are placed and raised. Deferred one tick so any focus churn
+				-- from the raises settles first (raising can emit focus events).
+				-- Urgency restore follows focus in the same tick: focusing
+				-- clears urgency on the focused client, so urgency must be
+				-- written after it, per record.
+				local tags = stellar_api._reconcile_tags
+				local wins = stellar_api._reconcile_windows
+				gears.timer.delayed_call(function()
+					apply_focus_active(tags)
+					apply_urgency(wins)
+				end)
+
+				-- Reconcile finished: disarm so normal placement resumes for
+				-- any later windows.
+				stellar_api._reconcile_active = false
+				stellar_api._reconcile_windows = nil
+				stellar_api._reconcile_tags = nil
+				return false  -- stop timer
+			end
+			return true  -- keep polling
+		end
+
+		gears.timer.start_new(interval, tick)
+	end
+
+	-- One-shot failsafe for the startup cover below (armed on first use).
+	local startup_cover_failsafe_armed = false
+
     client.connect_signal("manage", function(c)
 -- TODO: change this to set as active client only if normal window w/ titlebars
 		stellar_api.set_active_client(c)
+
+		-- Reconcile cover, at the earliest possible moment. Waiting for
+		-- RESTORE_STATE_BEGIN to hide (a socket round-trip away) lets the
+		-- remanaged windows PAINT first -- the visible flash. awesome.startup
+		-- is true exactly while Awesome remanages pre-existing windows, which
+		-- is the restart storm, so hide right here at manage. The BEGIN
+		-- mass-hide remains as a second net for anything missed.
+		--
+		-- Marker + failsafe: if this is actually a cold boot with pre-existing
+		-- windows (e.g. the whole DE restarted -- no restore blob will ever
+		-- arrive, no reveal will run), a one-shot timer unhides exactly the
+		-- windows we covered. reconcile_reveal clears the marker on every
+		-- window it settles, so after a normal restart the failsafe is a no-op.
+		if not is_tray(c) and (stellar_api._reconcile_active or awesome.startup) then
+			c.hidden = true
+			c._stellar_startup_covered = true
+			if not startup_cover_failsafe_armed then
+				startup_cover_failsafe_armed = true
+				gears.timer.start_new(2.5, function()
+					-- If reconcile is mid-flight, leave it alone -- its own
+					-- settle/failsafe owns the reveal.
+					if not stellar_api._reconcile_active then
+						local shown = 0
+						local s2 = screen[stellar.screen_num] or awful.screen.focused()
+						if s2 then
+							for _, cl in ipairs(s2.all_clients) do
+								if cl.valid and cl._stellar_startup_covered then
+									cl._stellar_startup_covered = nil
+									if cl.hidden then
+										cl.hidden = false
+										shown = shown + 1
+									end
+								end
+							end
+						end
+						if shown > 0 then
+							stellar_log("startup cover failsafe: no reconcile "
+								.. "arrived; revealed " .. shown .. " window(s)")
+						end
+					end
+					return false  -- one-shot
+				end)
+			end
+		end
 
         if c.type == "desktop" and is_fullscreen_desktop(c) then
             fit_to_screen(c)
             c._stellar_show_in_tasklist = true
         else
-			local edid_name = stellar_api.monitor_name or "Unknown_Monitor"
-			local state_path = get_geometry_state_file(c, edid_name)
-
-			-- ========================================================
-			-- CENTRALIZED PLACEMENT ENGINE
-			-- ========================================================
-			if not c._stellar_placement_handled then
-				local loaded_saved = false
-
-				-- Try to load saved geometry (Only for floating windows)
-				local saved_geo = stellar_api.load_client_geometry(c)
-				if saved_geo then
-					loaded_saved = true
-
-					-- Check if this is a Conflux window
-					local is_conflux = c.instance and c.instance:match("^stellar_conflux_")
-
-					-- Enforce-once guard. Some clients (e.g. Lutris)
-					-- re-assert their own remembered position shortly
-					-- after mapping, via a path that does NOT come
-					-- through request::geometry -- so the move only shows
-					-- up as property::geometry, which fires AFTER the
-					-- position already changed. We watch for the first
-					-- such deviation, snap it back to saved_geo once, then
-					-- disarm and let the window move freely thereafter.
-					--
-					-- Only clients that actually restored a saved
-					-- geometry arm this. Brand-new windows never do, so
-					-- their default placement is untouched.
-					if not is_conflux then
-						c._stellar_geom_guard = saved_geo
-
-						local function enforce_once(cl)
-							if not cl._stellar_geom_guard then return end
-							local g = cl._stellar_geom_guard
-							-- Disarm first so our own :geometry() call below
-							-- (which re-fires property::geometry) doesn't recurse.
-							cl._stellar_geom_guard = nil
-							cl:disconnect_signal("property::geometry", enforce_once)
-
-							local cur = cl:geometry()
-							if cur.x ~= g.x or cur.y ~= g.y
-								or cur.width ~= g.width or cur.height ~= g.height then
-								cl:geometry(g)
-								stellar_log("geom guard: overrode self-reposition of "
-									.. tostring(cl.class) .. " back to saved "
-									.. string.format("%d,%d,%d,%d", g.x, g.y, g.width, g.height))
-							end
-						end
-
-						c:connect_signal("property::geometry", enforce_once)
-
-						-- Safety net: if the client never repositions itself,
-						-- drop the guard so a much later legitimate move isn't
-						-- caught. Disarming is idempotent with enforce_once.
-						gears.timer.start_new(4.0, function()
-							if c.valid and c._stellar_geom_guard then
-								c._stellar_geom_guard = nil
-								c:disconnect_signal("property::geometry", enforce_once)
-							end
-							return false
-						end)
-					end
-				end
-
-				-- Fallback to settings.json defaults for brand new windows
-				if not loaded_saved and not c.fullscreen and not c.maximized then
-					local placement_rules = stellar_api.stellar_settings.default_placement
-					local placement_engine = require("awful.placement")
-
-					for _, rule_name in ipairs(placement_rules) do
-						if placement_engine[rule_name] then
-							placement_engine[rule_name](c, { honor_workarea = true })
-						end
-					end
-				end
+			-- During restart reconcile, the snapshot is the authority on the
+			-- reload path -- suppress the manage-time file geometry restore so
+			-- windows don't snap back to stale file geometry. Reconcile applies
+			-- z-stack now (3b-1) and full geometry/flags later (3b-2). Brand-new
+			-- windows that appear after reconcile disarms use normal placement.
+			if stellar_api._reconcile_active then
+				stellar_log("reconcile active: skipping file placement for "
+					.. tostring(c.class) .. " / " .. tostring(c.instance))
+			-- Placement decision. If the monitor name is already resolved
+			-- (always true on cold boot thanks to the DE settle barrier), place
+			-- immediately. If not (the reload race window, before the async
+			-- MONITOR_NAME push arrives), PARK this window and place it when the
+			-- name lands in the MONITOR_NAME/MONITOR_CHANGED handler, or when the
+			-- safety timer fires. This keeps geometry restore from keying on a
+			-- nil name and falling to corner placement.
+			elseif monitor_name_resolved() then
+				apply_placement(c)
+			else
+				table.insert(pending_placement, c)
+				stellar_log("parking window for placement (name unresolved): "
+					.. tostring(c.class) .. " / " .. tostring(c.instance))
 			end
 		end
 
@@ -1354,7 +2078,7 @@ local function install_stellar_hooks(socket_unix)
 
         if (c.floating or awful.layout.get(c.screen).name == "floating")
 		and not is_fullscreen_desktop(c) then
-            local edid_name = stellar_api.monitor_name or "Unknown_Monitor"
+            local edid_name = stellar_api.monitor_name  -- nil when unresolved; get_geometry_state_file fails closed
             local state_path = get_geometry_state_file(c, edid_name)
 			if state_path then
 				local geom = c:geometry()
@@ -1517,12 +2241,236 @@ local function install_stellar_hooks(socket_unix)
 	end)
 ]]--
 
+	-- Serialize full per-window state and stream it to the DE, one window per
+	-- line (RESTORE_STATE_WIN), bracketed by BEGIN/END, plus one TAGS line for
+	-- per-tag layout and the selected tag. The DE holds these opaquely and
+	-- replays them after the restart. One window per line keeps every line well
+	-- under the DE's 4096-byte IPC line buffer.
+	--
+	-- Excludes stalonetray (Stellar-owned, not affected by an Awesome restart).
+	-- fullscreen_desktop windows are marked so the (future) reconcile routes
+	-- them to the hidden/fit path instead of geometry restore.
+	--
+	-- NOTE (transport milestone): this only SERIALIZES and SENDS. The restored
+	-- Lua currently just parses and logs what comes back; reconciliation is a
+	-- later step.
+	local function is_stalonetray(c)
+		return c.class == "stalonetray"
+			or c.instance == "stalonetray"
+			or c.name == "stalonetray"
+	end
+
+	local function tag_indices(c)
+		-- Record which of this screen's tags the client is on, by tag index
+		-- (stable, layout-independent). Also record its position within each
+		-- tag's client list (tile-slot order) for tiled reconcile.
+		local out = {}
+		local s = c.screen
+		if not s then return out end
+		for ti, t in ipairs(s.tags) do
+			local clients = t:clients()
+			for ci, cc in ipairs(clients) do
+				if cc == c then
+					table.insert(out, { tag = ti, index = ci })
+					break
+				end
+			end
+		end
+		return out
+	end
+
+	local function serialize_window(c, stack_index)
+		local fsd = is_fullscreen_desktop(c)
+
+		-- Resolve ONE trusted geometry value for the payload.
+		--
+		-- While a window has an inflating atom set (fullscreen, or horizontal/
+		-- vertical maximize), c:geometry() returns the fake inflated rect, not
+		-- where the window really lives. c._saved_floating_geom holds the real
+		-- underlying rect. It is a Lua property so it dies with the Lua state on
+		-- restart -- but we read it HERE, at exit, before the re-exec, and bake
+		-- the resolved result into the payload's single geometry value. Nothing
+		-- separate is transmitted; the geometry field already IS the real rect.
+		--
+		-- Rule: if inflated, substitute _saved_floating_geom; if that is missing,
+		-- omit geometry (restore falls back to default placement -- shouldn't
+		-- happen in practice). If not inflated, use live geometry (or sfg if the
+		-- live value isn't set).
+		local sfg = c._saved_floating_geom
+
+		local inflated = c.fullscreen or c.maximized
+			or c.maximized_horizontal or c.maximized_vertical
+		local geo
+		if inflated then
+			geo = sfg   -- may be nil; handled by the (geo and ...) guard below
+		else
+			geo = sfg or c:geometry()
+		end
+
+		return {
+			wid        = c.window,
+			class      = c.class,
+			instance   = c.instance,
+			name       = c.name,
+			tags       = tag_indices(c),
+			stack      = stack_index,          -- position in screen.clients (z-order)
+			floating   = c.floating and true or false,
+			-- geometry: the trusted uninflated rect. For an inflated window
+			-- (fullscreen/maximize) this is the substituted saved_floating_geom;
+			-- for a normal window it's the live geometry. Omitted for
+			-- fullscreen_desktop, or for an inflated window with no saved
+			-- geometry to substitute (geo is nil then -> default placement on
+			-- restore; in practice this shouldn't happen).
+			geometry   = (not fsd and geo)
+				and { x = geo.x, y = geo.y, width = geo.width, height = geo.height } or nil,
+			minimized  = c.minimized and true or false,
+			-- Maximize is captured as the full flag plus both axes, since a
+			-- single-axis maximize has c.maximized == false but still inflates
+			-- one dimension. Restore sets the axes so the display matches.
+			maximized  = c.maximized and true or false,
+			maximized_horizontal = c.maximized_horizontal and true or false,
+			maximized_vertical   = c.maximized_vertical and true or false,
+			fullscreen = c.fullscreen and true or false,
+			ontop      = c.ontop and true or false,
+			sticky     = c.sticky and true or false,
+			hidden     = c.hidden and true or false,   -- intended hidden state (pre any cover)
+			-- Urgency is captured so reconcile can restore the pre-restart
+			-- truth: activation requests that land while a window is COVERED
+			-- (hidden) make Awesome's ewmh handler set urgent=true instead of
+			-- focusing (that is _NET_WM_STATE_DEMANDS_ATTENTION), and that
+			-- spurious flag would otherwise survive the reveal.
+			urgent     = c.urgent and true or false,
+			fullscreen_desktop = fsd and true or false,
+		}
+	end
+
+	local function serialize_tags()
+		local s = screen[stellar.screen_num] or awful.screen.focused()
+		local out = { layouts = {}, selected = nil, focused = nil, active = nil }
+		if not s then return out end
+		for ti, t in ipairs(s.tags) do
+			-- Per-tag layout name (each tag can have its own layout).
+			out.layouts[ti] = t.layout and t.layout.name or nil
+			if t.selected then out.selected = ti end
+		end
+
+		-- Focused window (Awesome input focus) and active client (Stellar's
+		-- committed/clicked window) are INDEPENDENT under FFM/sloppy focus, so
+		-- record both. Identify each by wid (normal windows) and instance
+		-- (Conflux tabs, whose wid churns across restart) so restore can match
+		-- either way.
+		local function ident(c)
+			if not c or not c.valid then return nil end
+			-- Only record if this client belongs to this screen.
+			if c.screen ~= s then return nil end
+			return { wid = c.window, instance = c.instance }
+		end
+
+		out.focused = ident(client.focus)
+		out.active  = ident(stellar_api._active_client)
+
+		return out
+	end
+
+	local function send_restart_snapshot()
+		local s = screen[stellar.screen_num] or awful.screen.focused()
+		send_line("RESTORE_STATE_BEGIN screen=" .. tostring(stellar.screen_num))
+
+		if s then
+			-- Pass 1: s.clients is the VISIBLE stacking order (index 1 = top);
+			-- stack_index captures z-order directly.
+			local idx = 0
+			local seen = {}
+			for _, c in ipairs(s.clients) do
+				if c.valid and not is_stalonetray(c) then
+					idx = idx + 1
+					seen[c] = true
+					local rec = serialize_window(c, idx)
+					local ok, encoded = pcall(json.encode, rec)
+					if ok and encoded then
+						send_line("RESTORE_STATE_WIN screen=" .. tostring(stellar.screen_num)
+							.. " " .. encoded)
+					else
+						stellar_log("restore snapshot: json.encode failed for "
+							.. tostring(c.class))
+					end
+				end
+			end
+
+			-- Pass 2: windows NOT in the visible stack -- hidden (e.g. Conflux
+			-- siblings) and minimized ones. s.clients excludes them, so without
+			-- this pass they'd have no record at all: the reveal's default-
+			-- unhide would expose hidden Conflux siblings, and minimized
+			-- windows would silently lose their state. stack=nil (not part of
+			-- the visible z-order; the z-stack apply skips them).
+			for _, c in ipairs(s.all_clients) do
+				if c.valid and not seen[c] and not is_stalonetray(c) then
+					local rec = serialize_window(c, nil)
+					local ok, encoded = pcall(json.encode, rec)
+					if ok and encoded then
+						send_line("RESTORE_STATE_WIN screen=" .. tostring(stellar.screen_num)
+							.. " " .. encoded)
+					else
+						stellar_log("restore snapshot: json.encode failed for "
+							.. tostring(c.class))
+					end
+				end
+			end
+		end
+
+		local ok, tags_encoded = pcall(json.encode, serialize_tags())
+		if ok and tags_encoded then
+			send_line("RESTORE_STATE_TAGS screen=" .. tostring(stellar.screen_num)
+				.. " " .. tags_encoded)
+		end
+
+		-- Conflux tab order + active tab per workspace, kept as a SEPARATE line
+		-- (workspace-scoped, not window-scoped). Reuses the same data shape as
+		-- relocate_workspace. Restored via conflux.seed_restart_restore() before
+		-- the orphaned tabs remanage, which fixes tab order/active-tab scramble
+		-- on restart.
+		do
+			local ok_cx, conflux = pcall(require, "modules.conflux")
+			if ok_cx and conflux and conflux.serialize_all_workspaces then
+				local ws_list = conflux.serialize_all_workspaces()
+				if ws_list and #ws_list > 0 then
+					local ok_enc, cx_encoded = pcall(json.encode, ws_list)
+					if ok_enc and cx_encoded then
+						send_line("RESTORE_CONFLUX screen=" .. tostring(stellar.screen_num)
+							.. " " .. cx_encoded)
+						stellar_log("restore snapshot: sent conflux state for "
+							.. #ws_list .. " workspace(s)")
+					end
+				end
+			end
+		end
+
+		send_line("RESTORE_STATE_END screen=" .. tostring(stellar.screen_num))
+		stellar_log("restore snapshot sent for screen " .. tostring(stellar.screen_num))
+	end
+
 	awesome.connect_signal("exit", function(reason_restart)
 		if reason_restart then
 			stellar_log("AwesomeWM is restarting. Sending RESTARTING event to DE...")
+
+			-- Serialize and hand the full window state to the DE, which holds
+			-- it across the restart and replays it on the sync handshake. This
+			-- captures live c:geometry() directly into the snapshot, so it is
+			-- the single source of truth for the reload path -- it does NOT go
+			-- through the geometry state files at all.
+			--
+			-- (The previous per-client batch save into the state files was
+			-- removed: it duplicated the snapshot, could write stale data, and
+			-- the manage-time file restore it fed will be suppressed on the
+			-- reload path once reconcile applies the snapshot. The state files
+			-- remain the mechanism for cold boot / individual close+reopen, fed
+			-- by the unmanage handler.)
+			send_restart_snapshot()
+
 			send_line("EVENT type=awesome_restarting screen=" .. tostring(stellar.screen_num))
 		else
 			stellar_log("AwesomeWM is quitting. Sending QUITTING event to DE...")
+			-- Include screen= so the DE clears only this screen's held blob.
 			send_line("EVENT type=awesome_quitting screen=" .. tostring(stellar.screen_num))
 		end
 

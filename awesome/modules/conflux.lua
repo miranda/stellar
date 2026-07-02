@@ -340,7 +340,7 @@ end
 -- @param workspace_name string The ID of the workspace group
 -- @param nuke_sessions boolean If true, also terminates the underlying atch sessions
 -- @return table The instance names that were terminated
-function conflux.kill_workspace(workspace_name, active_tab_client, nuke_sessions)
+function conflux.kill_workspace(workspace_name, target_client, nuke_sessions)
     if not workspace_name and workspace_name ~= "" then return {} end
 
     local instancees = {}
@@ -367,7 +367,7 @@ function conflux.kill_workspace(workspace_name, active_tab_client, nuke_sessions
         -- the save would fall through to a per-instance junk filename (or fail
         -- to resolve), which is why conflux geometry stopped persisting to the
         -- shared stellar_conflux_<workspace> file.
-        if c and c.valid and c == active_tab_client then
+        if c and c.valid and c == target_client then
             stellar_api.save_client_geometry(c, true)
         end
 
@@ -448,7 +448,7 @@ function conflux.relocate_workspace(target_client, target_screen)
     end
 
     -- Delegate the teardown to kill_workspace, which returns the affected instancees
-    local instancees = conflux.kill_workspace(workspace_name)
+    local instancees = conflux.kill_workspace(workspace_name, target_client)
     
     -- If nothing was killed (e.g. invalid workspace), abort the relocation
     if not instancees or #instancees == 0 then return end
@@ -544,6 +544,212 @@ function conflux.restore_workspace(data)
         }
         stellar_api.send_ipc("RELOCATE_ACK " .. json.encode(ack_payload))
     end
+end
+
+-- ============================================================
+-- Awesome-restart tab-order / active-tab persistence
+-- ------------------------------------------------------------
+-- On an awesome.restart(), Conflux clients survive (same X clients, stable
+-- instance names) but the Lua state is wiped. The orphan-adoption path in the
+-- manage handler rebuilds workspaces, but with NO memory of (a) the manual tab
+-- order or (b) which tab was active -- so it falls back to alphabetical order
+-- and "first orphan to arrive wins" as the visible tab. That is the "tabs move
+-- on restart" bug.
+--
+-- These two functions bridge that gap using the SAME data shape and machinery
+-- as relocate_workspace/restore_workspace, minus any spawning (the clients are
+-- alive; we only restore metadata):
+--   serialize_all_workspaces() -> array of { workspace, tab_order, active_tab }
+--   seed_restart_restore(list) -> pre-seed tab_orders + pending_restores so the
+--                                 orphan-adoption manage handler restores order
+--                                 and activates the correct tab.
+
+-- Capture every live workspace's ordered instance list and active tab. This is
+-- the per-workspace capture from relocate_workspace, generalized over all
+-- groups. Returns a plain array, ready for json.encode.
+function conflux.serialize_all_workspaces()
+    local seen = {}
+    local out = {}
+
+    for _instance, ws_name in pairs(conflux.workspaces) do
+        if not seen[ws_name] then
+            seen[ws_name] = true
+
+            -- Ordered instance list (shallow copy; same as relocate).
+            local order = conflux.get_tab_order(ws_name)
+            local saved_order = {}
+            for _, name in ipairs(order) do table.insert(saved_order, name) end
+
+            -- Active tab = the group member that is currently visible.
+            local active_tab = nil
+            for _, inst in ipairs(saved_order) do
+                local tc = conflux.find_client_for_workspace(inst)
+                if tc and tc.valid and not tc.hidden then
+                    active_tab = inst
+                    break
+                end
+            end
+
+            table.insert(out, {
+                workspace  = ws_name,
+                tab_order  = saved_order,
+                active_tab = active_tab,
+            })
+        end
+    end
+
+    return out
+end
+
+-- Pre-seed restore state for the restart path. Does NOT spawn anything: the
+-- orphaned clients are still alive and will remanage on their own, hitting the
+-- orphan-adoption branch of the manage handler, which now consults
+-- pending_restores (see the patch there) to order and activate correctly.
+--
+-- `list` is the array produced by serialize_all_workspaces (decoded from JSON).
+--
+-- Order-independent w.r.t. the orphan manage signals: if the seed arrives
+-- BEFORE the orphans remanage, the manage handler drives activation via the
+-- pending_restores arrival counter. If the seed arrives AFTER some/all orphans
+-- have already remanaged (the socket-read-vs-manage race), we detect the
+-- already-present tabs here and activate the correct one immediately, so the
+-- outcome is the same either way.
+function conflux.seed_restart_restore(list)
+    if type(list) ~= "table" then return end
+
+    for _, entry in ipairs(list) do
+        local ws = entry.workspace
+        local order = entry.tab_order
+        if ws and type(order) == "table" and #order > 0 then
+            -- Override the alphabetical rebuild with the saved manual order.
+            conflux.tab_orders[ws] = {}
+            for _, name in ipairs(order) do
+                table.insert(conflux.tab_orders[ws], name)
+            end
+
+            -- Count how many of this workspace's tabs are already managed
+            -- (i.e. orphans that remanaged before this seed arrived).
+            local already_here = 0
+            for _, inst in ipairs(order) do
+                local tc = conflux.find_client_for_workspace(inst)
+                if tc and tc.valid then already_here = already_here + 1 end
+            end
+
+            if entry.active_tab and already_here >= #order then
+                -- All tabs already back before we seeded: the manage handler's
+                -- arrival counter won't fire (it ran before pending_restores
+                -- existed). Activate the correct tab now, authoritatively.
+                conflux.pending_restores[ws] = nil
+                local active_inst = entry.active_tab
+                gears.timer.delayed_call(function()
+                    conflux.force_active_tab(ws, active_inst)
+                end)
+                -- Re-assert once more after a short settle so a late orphan
+                -- that un-hides itself can't leave the wrong tab visible.
+                gears.timer.start_new(0.25, function()
+                    conflux.force_active_tab(ws, active_inst)
+                    return false
+                end)
+                stellar_api.log("conflux: restart restore for " .. tostring(ws)
+                    .. " -- all " .. #order .. " tab(s) already present, "
+                    .. "activating " .. tostring(active_inst) .. " directly")
+            elseif entry.active_tab then
+                -- Some tabs still to arrive: arm the counter, pre-crediting the
+                -- ones already here so the threshold is reached when the rest
+                -- remanage.
+                conflux.pending_restores[ws] = {
+                    expected   = #order,
+                    arrived    = already_here,
+                    active_tab = entry.active_tab,
+                }
+                stellar_api.log("conflux: seeded restart restore for workspace "
+                    .. tostring(ws) .. " (" .. #order .. " tab(s), "
+                    .. already_here .. " already here, active="
+                    .. tostring(entry.active_tab) .. ")")
+            end
+
+            -- Nudge any already-present group members to redraw their tab bars
+            -- from the now-corrected tab_orders (the tab bar reads
+            -- get_tab_order() fresh on this signal). Harmless if none are here
+            -- yet -- the orphan-adoption manage path emits the same signal as
+            -- each tab arrives.
+            for inst, ws_name2 in pairs(conflux.workspaces) do
+                if ws_name2 == ws then
+                    local gc = conflux.find_client_for_workspace(inst)
+                    if gc and gc.valid then
+                        gc:emit_signal("property::_STELLAR_CONFLUX_WORKSPACE")
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Authoritative active-tab enforcement for the restart path.
+--
+-- activate_tab() is built for the interactive case: it assumes exactly ONE
+-- group member is currently visible (old_c) and swaps it for the target. During
+-- an Awesome-restart arrival storm that assumption breaks -- zero or two+ tabs
+-- can be transiently visible as orphans remanage -- so activate_tab can leave a
+-- second visible tab on top of the target (~30% "wrong active tab"). This
+-- function is order/arrival-independent: it makes the target visible and hides
+-- EVERY other member of the group, regardless of how many were visible. It is
+-- idempotent, so re-firing it converges to the correct state even if a late
+-- orphan un-hides itself.
+function conflux.force_active_tab(workspace_name, target_instance)
+    if not workspace_name or not target_instance then return end
+
+    local target_client = conflux.find_client_for_workspace(target_instance)
+    if not target_client or not target_client.valid then
+        -- Target not present yet; nothing to enforce this pass. The arrival
+        -- counter / re-assert timer will call again once it is here.
+        return
+    end
+
+    -- Show the target with full decorations, matching geometry from any
+    -- currently-visible sibling first (same frame-size care as activate_tab).
+    local sibling_visible = nil
+    for inst, ws_name in pairs(conflux.workspaces) do
+        if ws_name == workspace_name and inst ~= target_instance then
+            local c = conflux.find_client_for_workspace(inst)
+            if c and c.valid and not c.hidden then
+                sibling_visible = c
+                break
+            end
+        end
+    end
+
+    conflux.set_decorations_visible(target_client, true)
+    if sibling_visible then
+        target_client.floating = sibling_visible.floating
+        target_client:geometry(sibling_visible:geometry())
+    end
+    target_client.hidden = false
+
+    -- Hide EVERY other member unconditionally.
+    for inst, ws_name in pairs(conflux.workspaces) do
+        if ws_name == workspace_name and inst ~= target_instance then
+            local c = conflux.find_client_for_workspace(inst)
+            if c and c.valid and not c.hidden then
+                conflux.set_decorations_visible(c, false)
+                c.hidden = true
+            end
+        end
+    end
+
+    -- Raise and focus the target after the hides (hiding can trigger a layout
+    -- recalculation that steals focus).
+    if target_client.valid then
+        target_client:raise()
+        client.focus = target_client
+        target_client:emit_signal("property::_STELLAR_CONFLUX_WORKSPACE")
+    end
+
+    gears.timer.delayed_call(function()
+        if target_client.valid then
+            stellar_api.set_active_client(target_client)
+        end
+    end)
 end
 
 function conflux.activate_tab(target_instance)
@@ -935,6 +1141,11 @@ client.connect_signal("manage", function(c)
 			if existing_workspace and existing_workspace ~= "" then
 				-- Reconstruct the internal Lua state first so the sibling search
 				-- below can see prior orphans that already went through this path.
+				-- add_workspace appends to tab_orders IF an order already exists;
+				-- when conflux.seed_restart_restore() pre-seeded the saved manual
+				-- order, this preserves it (append is a no-op for known instances,
+				-- and unknown ones are appended). Without a seed it falls back to
+				-- the alphabetical rebuild as before.
 				conflux.add_workspace(existing_workspace, instance)
 
 				-- Look for a sibling that has already been promoted to visible
@@ -956,7 +1167,10 @@ client.connect_signal("manage", function(c)
 					conflux.set_decorations_visible(c, false)
 					c.hidden = true
 				end
-				-- else: first orphan in this group, leave it visible as the active tab
+				-- else: first orphan in this group, leave it visible for now.
+				-- If a restart restore is armed (pending_restores), the correct
+				-- active tab is activated below once all orphans are back, which
+				-- overrides this provisional "first visible" choice.
 
 				-- Broadcast redraw to every member of the group so tab bars rebuild
 				-- with the full roster, not just whatever was registered when each
@@ -967,6 +1181,36 @@ client.connect_signal("manage", function(c)
 						if group_client then
 							group_client:emit_signal("property::_STELLAR_CONFLUX_WORKSPACE")
 						end
+					end
+				end
+
+				-- Restart-restore: count orphan arrivals and, once the whole
+				-- roster is back, activate the tab that was active before the
+				-- restart. Uses force_active_tab (authoritative group visibility)
+				-- rather than activate_tab, because during the arrival storm
+				-- more than one member can be transiently visible and the
+				-- one-visible swap assumption in activate_tab would leave the
+				-- wrong tab on top. Seeded by conflux.seed_restart_restore().
+				local pr = conflux.pending_restores[existing_workspace]
+				if pr then
+					pr.arrived = pr.arrived + 1
+					if pr.arrived >= pr.expected then
+						local active_inst = pr.active_tab
+						local ws_done = existing_workspace
+						conflux.pending_restores[existing_workspace] = nil
+						gears.timer.delayed_call(function()
+							if active_inst then
+								conflux.force_active_tab(ws_done, active_inst)
+							end
+						end)
+						-- Re-assert after a short settle to override any late
+						-- orphan that un-hides itself after this pass.
+						gears.timer.start_new(0.25, function()
+							if active_inst then
+								conflux.force_active_tab(ws_done, active_inst)
+							end
+							return false
+						end)
 					end
 				end
 			end
